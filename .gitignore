@@ -1,0 +1,18 @@
+# Swift build artifacts
+.build/
+build/
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Never commit credentials. Murmur reads keys from
+# ~/.config/murmur/.env, which lives outside this repo — keep it that way.
+.env
+.env.*
+!.env.example
+
+# Local models are large; download them per the README instead.
+*.bin
+models/
