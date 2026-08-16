@@ -18,10 +18,23 @@ CERT_NAME="Murmur Self-Signed"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
-  echo "==> '$CERT_NAME' already exists in your keychain. Nothing to do."
-  echo "    Rebuild with ./build.sh --install and grant permissions once more."
+# Check for a *usable* identity, not merely a certificate. Importing the cert
+# and marking it trusted are two separate steps, and the second one needs an
+# interactive password — so a half-finished run leaves a cert that codesign
+# cannot use. Testing only for the cert would then wrongly report success.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$CERT_NAME"; then
+  echo "==> '$CERT_NAME' is already set up and trusted for code signing."
+  echo "    Nothing to do — ./build.sh --install will use it automatically."
   exit 0
+fi
+
+if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
+  echo "==> Found a '$CERT_NAME' certificate that is NOT trusted for code signing."
+  echo "    (A previous run imported it but did not finish.) Removing it so this"
+  echo "    run can start clean…"
+  security delete-certificate -c "$CERT_NAME" >/dev/null 2>&1 \
+    || { echo "!! Could not remove it. Open Keychain Access, delete '$CERT_NAME', and rerun."; exit 1; }
+  echo "    removed."
 fi
 
 echo "==> Generating a self-signed code-signing certificate…"
