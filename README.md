@@ -25,7 +25,40 @@ hold fn ──▶ record mic ──▶ release ──▶ whisper ──▶ LLM c
 
 ---
 
-## Install
+## Setting up on another Mac
+
+```bash
+git clone https://github.com/cancilleriluis/murmur.git ~/Murmur
+cd ~/Murmur
+
+# 1. Local transcription engine + model (~465 MB)
+brew install whisper-cpp
+mkdir -p ~/.config/murmur/models
+curl -L -o ~/.config/murmur/models/ggml-small.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+
+# 2. Stable signing identity — do this BEFORE the first build so you grant
+#    permissions once instead of after every rebuild
+./setup-signing.sh
+
+# 3. Build and install
+./build.sh --install
+```
+
+Then grant Microphone, Accessibility, and Input Monitoring (see below), and
+quit/reopen the app once.
+
+**Your API keys are deliberately not in this repo.** On first run the app
+creates `~/.config/murmur/.env` with empty placeholders — fill them in by hand
+on the new machine, or copy the file across over something private (AirDrop, a
+password manager, `scp`). Never commit it. Without keys the app still works
+fully offline; you just don't get the LLM cleanup pass.
+
+Settings live in `~/.config/murmur/config.json` and are also not in the repo, so
+each machine can have its own hotkey and provider. Copy that file too if you
+want identical behaviour on both.
+
+## Install (same machine)
 
 ```bash
 cd ~/Murmur
