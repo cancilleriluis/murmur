@@ -78,7 +78,8 @@ cat <<'EOF'
      over AirDrop, or paste the values from your password manager.
      Never commit that file.
 
-  Hold the push-to-talk key (Left Option by default), speak, release.
+  Hold the push-to-talk key (fn by default; change it from the menu bar),
+  speak, release.
   Verify anything without the mic or hotkey:
      /Applications/Murmur.app/Contents/MacOS/Murmur --test-pipeline some.wav
 

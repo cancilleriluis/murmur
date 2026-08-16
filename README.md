@@ -7,6 +7,50 @@ No accounts. No telemetry. No network at all when you use the local model.
 
 ---
 
+## What it actually does
+
+Hold the push-to-talk key anywhere in macOS and say:
+
+> um so like the thing is we should probably ship this on friday i think uh
+> because the client demo is monday
+
+Release the key, and about a second later this appears at your cursor:
+
+> We should probably ship this on Friday, because the client demo is Monday.
+
+Two things happened there. Whisper turned the audio into text, and a second
+pass — a small LLM with a dictation-specific prompt — removed the fillers, added
+the punctuation, and fixed the casing. That second pass is what separates this
+from the dictation built into your OS, and it is optional and configurable.
+
+It works in Slack, Notes, a terminal, a browser text field, your editor —
+anywhere a caret blinks. There is no per-app integration: insertion is a
+synthetic ⌘V (or synthesized keystrokes) into whatever holds focus, so an app
+that accepts typing accepts Murmur.
+
+**Where it's different from the hosted dictation apps:**
+
+- **It can run fully offline.** whisper.cpp transcribes locally; point cleanup
+  at Ollama and the audio and the text both stay on the machine. No account, no
+  subscription, no update checks, no analytics.
+- **You own the cleanup prompt.** `cleanup.prompt` in a JSON file, not a vendor's
+  hidden model behaviour. Swap providers or models per taste and latency budget.
+- **It's ~2,400 lines of Swift you compile yourself.** No installer, no signed
+  binary from a stranger — which is also why the permissions dance below is a
+  step you have to do consciously.
+- **It's multilingual by default and never translates.** Speak Spanish, get
+  Spanish. Switch languages mid-sentence and both survive (with the right model
+  — see the table further down).
+
+**What you need:** macOS 13 or later, Homebrew, Xcode Command Line Tools, and
+about 500 MB of disk for the speech model. Apple Silicon is much faster, but
+Intel works. API keys are optional; without them you get raw transcripts.
+
+**What it is not:** a real-time captioner, a meeting transcriber, or a voice
+assistant. It is a key you hold to type with your mouth.
+
+---
+
 ## How it works
 
 ```
@@ -25,7 +69,95 @@ hold fn ──▶ record mic ──▶ release ──▶ whisper ──▶ LLM c
 
 ---
 
-## Setting up on another Mac
+## Install
+
+### The one-command way
+
+```bash
+git clone https://github.com/cancilleriluis/murmur.git ~/Murmur
+cd ~/Murmur && ./bootstrap.sh
+```
+
+`bootstrap.sh` checks your prerequisites, installs whisper.cpp, downloads the
+~465 MB speech model, creates a stable signing identity (macOS will ask for your
+login password — that's the keychain, nothing leaves the machine), then builds
+and installs `Murmur.app`. Every step checks whether it's already done, so it's
+safe to re-run after a failure.
+
+Two things it deliberately leaves to you: granting the three permissions, and
+adding API keys. Both are covered below.
+
+### Let an AI agent do it
+
+If you use Claude Code, Cursor, Codex, or any other agent with terminal access,
+paste this and it will handle the clone, the install, the verification, and
+walking you through the permission dialogs. Copy the whole block:
+
+```text
+Set up Murmur, a macOS push-to-talk dictation app, on this Mac.
+
+1. Clone https://github.com/cancilleriluis/murmur into ~/Murmur. If it's
+   already there, git pull instead of re-cloning.
+2. Read ~/Murmur/README.md and ~/Murmur/bootstrap.sh, then tell me in a few
+   lines what the script is about to do before you run it.
+3. Run ./bootstrap.sh and show me the output as it goes. It installs
+   whisper-cpp via Homebrew, downloads a ~465 MB model into
+   ~/.config/murmur/models, creates a self-signed code-signing identity, and
+   builds and installs Murmur.app. It will ask for my login password once, for
+   the keychain.
+4. Verify the install without touching the mic. Generate a test WAV:
+     say -o /tmp/murmur-test.aiff "This is a test of the dictation pipeline"
+     afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/murmur-test.aiff /tmp/murmur-test.wav
+   then run:
+     /Applications/Murmur.app/Contents/MacOS/Murmur --test-pipeline /tmp/murmur-test.wav
+   Report which backend resolved, the transcript, and the per-stage timings.
+5. Walk me through granting Microphone, Input Monitoring and Accessibility in
+   System Settings > Privacy & Security, one at a time, waiting for me to
+   confirm each. Then remind me to quit Murmur from the menu bar and reopen it
+   — macOS only hands new permissions to a freshly launched process.
+6. Ask me whether I want the optional LLM cleanup pass. If yes, open
+   ~/.config/murmur/.env so I can paste in a GROQ_API_KEY or OPENAI_API_KEY
+   myself. Do not echo the key back, do not put it in any other file, and never
+   commit it.
+
+Ask me before anything destructive — deleting an existing ~/.config/murmur,
+or overwriting a config.json I already have.
+```
+
+**Chat-only tools** (ChatGPT, Claude, Gemini in the browser) can't run the
+install, but they're good at the parts that go wrong. This one turns the docs
+into a checklist for your specific machine:
+
+```text
+Read https://github.com/cancilleriluis/murmur and its README.
+
+I'm on macOS <your version> with <Apple Silicon / Intel>. Give me a numbered
+setup checklist for exactly my machine, including which speech model size you'd
+recommend and whether I need API keys at all for what I want (I mostly dictate
+in <your languages>). Then explain, in plain terms, what each of the three macOS
+permissions is for and what breaks if I skip it.
+```
+
+And when something misbehaves, this saves a lot of guessing:
+
+```text
+Murmur (github.com/cancilleriluis/murmur) isn't working: <describe the symptom>.
+Here is the tail of ~/.config/murmur/murmur.log:
+
+<paste the log>
+
+Here is ~/.config/murmur/config.json (I've removed anything private):
+
+<paste the config>
+
+Using the repo's README troubleshooting section, tell me which stage is failing
+— hotkey capture, audio, transcription, cleanup, or insertion — and the single
+next thing to try.
+```
+
+### Manual install
+
+If you'd rather run the steps yourself, or you already have whisper.cpp:
 
 ```bash
 git clone https://github.com/cancilleriluis/murmur.git ~/Murmur
@@ -45,31 +177,23 @@ curl -L -o ~/.config/murmur/models/ggml-small.bin \
 ./build.sh --install
 ```
 
-Then grant Microphone, Accessibility, and Input Monitoring (see below), and
-quit/reopen the app once.
+`build.sh --install` compiles a release binary, wraps it in `Murmur.app`, signs
+it, copies it to `/Applications`, and launches it. You'll get a waveform icon in
+the menu bar. To build without installing, run `./build.sh` — the bundle lands
+in `build/`.
 
-**Your API keys are deliberately not in this repo.** On first run the app
-creates `~/.config/murmur/.env` with empty placeholders — fill them in by hand
-on the new machine, or copy the file across over something private (AirDrop, a
-password manager, `scp`). Never commit it. Without keys the app still works
-fully offline; you just don't get the LLM cleanup pass.
+Rebuilding later is just `./build.sh --install` again.
 
-Settings live in `~/.config/murmur/config.json` and are also not in the repo, so
-each machine can have its own hotkey and provider. Copy that file too if you
-want identical behaviour on both.
+### Keys and settings are not in this repo
 
-## Install (same machine)
+On first run the app creates `~/.config/murmur/.env` with empty placeholders.
+Fill them in by hand, or copy the file across from another machine over
+something private (AirDrop, a password manager, `scp`). Never commit it. Without
+keys the app still works fully offline; you just don't get the LLM cleanup pass.
 
-```bash
-cd ~/Murmur
-./build.sh --install
-```
-
-That compiles a release binary, wraps it in `Murmur.app`, ad-hoc signs it,
-copies it to `/Applications`, and launches it. You'll get a waveform icon in
-the menu bar.
-
-To build without installing, run `./build.sh` — the bundle lands in `build/`.
+Settings live in `~/.config/murmur/config.json`, also outside the repo, so each
+machine can have its own hotkey and provider. Copy that file too if you want
+identical behaviour on both.
 
 ### Local transcription (offline)
 
@@ -174,6 +298,7 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
     "enabled": true,
     "provider": "auto",              // auto | groq | openai | anthropic | local
     "model": "",                     // empty = provider default
+    "style": "auto",                 // auto | clean | structured (see below)
     "prompt": "",                    // empty = built-in dictation prompt
     "base_url": "",                  // empty = provider default; primary only
     "fallback_provider": "openai",   // retried when the primary fails
