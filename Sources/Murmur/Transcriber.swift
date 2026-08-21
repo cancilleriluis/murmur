@@ -22,9 +22,12 @@ struct Transcriber {
     let config: Config
 
     /// Language of the last successful transcription ("es", "en", …) or "" if
-    /// unknown. Read after `transcribe` for history/logging.
+    /// unknown, plus which backend actually served it. Read after `transcribe`
+    /// for history/logging — `backend` is the only way to tell from the log
+    /// whether a dictation went to Groq or ran on the local model.
     final class Result {
         var language: String = ""
+        var backend: String = ""
     }
     let result = Result()
 
@@ -99,6 +102,8 @@ struct Transcriber {
     }
 
     private func transcribeLocal(wav: URL) throws -> String {
+        let modelName = resolvedModel().map { ($0 as NSString).lastPathComponent } ?? "no model"
+        result.backend = "local whisper.cpp (\(modelName))"
         let pinned = config.language.lowercased()
         if pinned != "auto" {
             result.language = pinned
@@ -184,7 +189,7 @@ struct Transcriber {
 
     // MARK: - Hosted Whisper (Groq / OpenAI)
 
-    enum Provider {
+    enum Provider: String {
         case groq, openai
         var endpoint: URL {
             switch self {
@@ -207,6 +212,7 @@ struct Transcriber {
     }
 
     private func transcribeAPI(wav: URL, provider: Provider) throws -> String {
+        result.backend = "\(provider.rawValue) \(provider.model)"
         let pinned = config.language.lowercased()
         let first = try callAPI(wav: wav, provider: provider,
                                 language: pinned == "auto" ? nil : pinned)
