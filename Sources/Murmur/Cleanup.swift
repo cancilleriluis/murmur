@@ -105,9 +105,11 @@ struct Cleanup {
             if let out = attemptPolish(provider: attempt.provider, key: key,
                                        model: attempt.model, base: attempt.base,
                                        system: system, original: trimmed) {
-                if index > 0 {
-                    Log.write("cleanup fell back to \(attempt.provider.rawValue)/\(attempt.model)")
-                }
+                // Logged on every dictation, not just fallbacks: "is my cleanup
+                // actually hitting Groq?" is otherwise unanswerable from the log.
+                Log.write(index == 0
+                    ? "cleanup via \(attempt.provider.rawValue)/\(attempt.model)"
+                    : "cleanup fell back to \(attempt.provider.rawValue)/\(attempt.model)")
                 return out
             }
         }

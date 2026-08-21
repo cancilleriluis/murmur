@@ -74,11 +74,9 @@ cat <<'EOF'
   2. API KEYS (optional — it works offline without them)
      Edit ~/.config/murmur/.env and fill in the keys you use.
      Without them you get raw transcripts; with them you get filler removal,
-     punctuation, and enumerated points. Copy the file from your other Mac
-     over AirDrop, or paste the values from your password manager.
-     Never commit that file.
+     punctuation, and enumerated points. Never commit that file.
 
-  Hold the push-to-talk key (Left Option by default), speak, release.
+  Hold the push-to-talk key (fn by default), speak, release.
   Verify anything without the mic or hotkey:
      /Applications/Murmur.app/Contents/MacOS/Murmur --test-pipeline some.wav
 

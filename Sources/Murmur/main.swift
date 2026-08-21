@@ -132,10 +132,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
 
             do {
+                let startedAt = Date()
                 let transcriber = Transcriber(config: config)
                 let raw = try transcriber.transcribe(wav: result.url)
+                let transcribeSeconds = Date().timeIntervalSince(startedAt)
                 let lang = transcriber.result.language
-                Log.write("transcript [\(lang)] (\(raw.count) chars): \(String(raw.prefix(120)))")
+                Log.write(String(format: "transcribed in %.2fs via %@ [%@] (%ld chars): %@",
+                                 transcribeSeconds, transcriber.result.backend, lang,
+                                 raw.count, String(raw.prefix(120))))
                 if config.filter_hallucinations, Transcriber.isLikelyHallucination(raw) {
                     Log.write("discarded — known whisper hallucination: \"\(raw)\"")
                     DispatchQueue.main.async {
@@ -153,7 +157,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
+                let cleanupStartedAt = Date()
                 let polished = Cleanup(config: config).polish(raw)
+                Log.write(String(format: "cleanup %.2fs — %.2fs total from key release",
+                                 Date().timeIntervalSince(cleanupStartedAt),
+                                 Date().timeIntervalSince(startedAt)))
                 History.add(text: polished, language: lang,
                             duration: result.duration, config: config.history)
 
