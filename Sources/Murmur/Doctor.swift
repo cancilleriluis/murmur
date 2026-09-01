@@ -88,7 +88,24 @@ final class Doctor {
             }
         }
         if !localReady {
-            notes.append("Local transcription is unavailable, so every dictation depends on a hosted API. `./bootstrap.sh` installs whisper.cpp and the model.")
+            // Say which half is missing. "unavailable" on its own sent people
+            // to rerun a bootstrap that had already done its job.
+            if cli == nil {
+                problems.append("whisper-cli is not installed — `brew install whisper-cpp`. Until then every dictation needs a working API key and an unblocked network.")
+            }
+            if model == nil {
+                let stubs = suspiciousModelFiles()
+                if stubs.isEmpty {
+                    problems.append("No speech model in \(Paths.modelsDir.path) — `./bootstrap.sh` downloads one (~465 MB).")
+                } else {
+                    // A file that is named like a model but isn't one. curl
+                    // without -f writes the server's error page to the output
+                    // file and still exits 0, so a failed download leaves a
+                    // few KB of HTML called ggml-small.bin and every later
+                    // check happily reports "model already present".
+                    problems.append("\(stubs.joined(separator: ", ")) — that is a failed download, not a model. Delete it and rerun ./bootstrap.sh.")
+                }
+            }
         }
 
         // MARK: Keys
@@ -122,12 +139,13 @@ final class Doctor {
         // MARK: Live network checks
         section("Connectivity")
         var probed = false
+        var working: [String] = []
         for provider in [Cleanup.Provider.groq, .openai, .anthropic, .xai] {
             guard let key = Env.get(provider.keyName) else { continue }
             probed = true
             let result = probe(provider: provider, key: key)
             row(provider.host, result.line)
-            if let problem = result.problem { problems.append(problem) }
+            if let problem = result.problem { problems.append(problem) } else { working.append(provider.rawValue) }
         }
         // A custom base_url (Ollama, LM Studio, llama.cpp) is the other common
         // "unreachable": the server simply isn't running on that port.
@@ -168,6 +186,20 @@ final class Doctor {
         section("Summary")
         if localReady {
             emit("  ✓ Local transcription is ready — a blocked or expired API cannot stop dictation.")
+        } else {
+            // The one combination that means dictation is dead right now, and
+            // the one worth spelling out rather than leaving as two separate
+            // bullet points the reader has to combine.
+            let transcribers = working.filter { $0 == "groq" || $0 == "openai" }
+            if transcribers.isEmpty {
+                emit("  ✗ Nothing can transcribe: no local model, and no hosted provider is answering.")
+                emit("    Shortest way out is local — it removes the network from the equation entirely:")
+                emit("      cd ~/Murmur && ./bootstrap.sh")
+            } else {
+                emit("  ! Transcription is working through \(transcribers.joined(separator: " / ")) only.")
+                emit("    That is one blocked network or expired key away from stopping. `./bootstrap.sh`")
+                emit("    installs the local model and makes the hosted providers a fallback instead.")
+            }
         }
         if cfg.cleanup.enabled && cleanup.resolveProvider() == nil {
             emit("  ! Cleanup is on but no provider has a key — transcripts will be inserted raw.")
@@ -211,9 +243,16 @@ final class Doctor {
             return ProbeResult(line: list.line,
                                problem: "\(provider.host) is unreachable: \(list.line)")
         }
-        if list.status == 401 || list.status == 403 {
+        if list.status == 401 {
             return ProbeResult(line: "\(list.line) — the key is being rejected",
-                               problem: "\(provider.keyName) was rejected by \(provider.host) (HTTP \(list.status!)).")
+                               problem: "\(provider.keyName) was rejected by \(provider.host) (401). The key is wrong, expired, or revoked.")
+        }
+        if list.status == 403 {
+            // 403 is NOT 401. Reporting it as a bad key sends you off to
+            // regenerate a key that was fine all along — which is the exact
+            // trap this repo already documents for Groq, and which this
+            // function walked straight into. Let the response body decide.
+            return classifyForbidden(list, provider: provider)
         }
 
         // Cheapest possible real completion: one token, no thinking.
@@ -243,6 +282,32 @@ final class Doctor {
         }
         return ProbeResult(line: "models OK, completions failed: \(detail)",
                            problem: "\(provider.host) accepted the key but refused a completion: \(detail)")
+    }
+
+    /// A 403 means "I know who you are and I still won't serve you", which for
+    /// these providers is almost always about *where the request came from*,
+    /// not the key. Groq refuses VPN, datacenter and some regional IPs with a
+    /// plain "Access denied. Please check your network settings." — no header,
+    /// no retry and no new key gets past it.
+    private func classifyForbidden(_ probe: RawProbe, provider: Cleanup.Provider) -> ProbeResult {
+        let body = probe.line.lowercased()
+        let saysKey = body.contains("invalid_api_key") || body.contains("invalid api key")
+            || body.contains("authentication") || body.contains("unauthorized")
+        let saysNetwork = body.contains("network settings") || body.contains("access denied")
+            || body.contains("cloudflare") || body.contains("region")
+            || body.contains("not available in your")
+
+        if saysKey && !saysNetwork {
+            return ProbeResult(line: "\(probe.line) — the key is being rejected",
+                               problem: "\(provider.keyName) was rejected by \(provider.host) (403, and the response names the key).")
+        }
+        if saysNetwork || provider == .groq {
+            return ProbeResult(
+                line: "\(probe.line) — this is the NETWORK being refused, not the key",
+                problem: "\(provider.host) refuses this IP address (403). \(provider == .groq ? "Groq blocks VPN, datacenter and some regional addresses" : "The provider is blocking this network or region") — a new key will not help. Turn any VPN off and rerun, or stop depending on it by installing the local model.")
+        }
+        return ProbeResult(line: "\(probe.line) — 403, cause unclear from the response",
+                           problem: "\(provider.host) returned 403. Read the response text above: if it names the key, replace it; if it mentions the network or your region, the key is fine and the IP is blocked.")
     }
 
     private func authorize(_ req: inout URLRequest, provider: Cleanup.Provider, key: String) {
@@ -309,18 +374,51 @@ final class Doctor {
         return String(format: "%.1f MB", bytes / 1_048_576)
     }
 
+    /// Files named like a model that cannot be one — too small, or not
+    /// actually in ggml format. Returned as ready-to-read descriptions.
+    private func suspiciousModelFiles() -> [String] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: Paths.modelsDir.path) else { return [] }
+        return names
+            .filter { $0.hasPrefix("ggml-") && $0.hasSuffix(".bin") }
+            .sorted()
+            .compactMap { name in
+                let path = Paths.modelsDir.appendingPathComponent(name).path
+                let bytes = ((try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.int64Value ?? 0
+                if bytes < 1_000_000 { return "\(name) is only \(bytes) bytes" }
+                if !Doctor.looksLikeGGML(path) { return "\(name) is not in ggml format" }
+                return nil
+            }
+    }
+
+    /// whisper.cpp models start with the four bytes `ggml`. An HTML error page
+    /// saved under a .bin name does not.
+    static func looksLikeGGML(_ path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        guard let magic = try? handle.read(upToCount: 4), magic.count == 4 else { return false }
+        return magic.elementsEqual([0x67, 0x67, 0x6d, 0x6c])   // "ggml"
+    }
+
     private func modelsDirSummary() -> String {
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: Paths.modelsDir.path) else {
             return "\(Paths.modelsDir.path) — unreadable or missing"
         }
         let models = names.filter { $0.hasPrefix("ggml-") && $0.hasSuffix(".bin") }.sorted()
-        if models.isEmpty {
-            let others = names.filter { !$0.hasPrefix(".") }
-            return others.isEmpty
-                ? "empty"
-                : "no ggml-*.bin — found instead: \(others.prefix(5).joined(separator: ", "))"
+        if !models.isEmpty {
+            // Sizes, because "ggml-small.bin is present" and "ggml-small.bin is
+            // a usable model" are different statements and only one of them is
+            // worth printing.
+            return models.map { name in
+                let path = Paths.modelsDir.appendingPathComponent(name).path
+                let ok = Doctor.looksLikeGGML(path)
+                return "\(name) (\(self.fileSize(path))\(ok ? "" : ", NOT a ggml file"))"
+            }.joined(separator: ", ")
         }
-        return models.joined(separator: ", ")
+        let others = names.filter { !$0.hasPrefix(".") }
+        return others.isEmpty
+            ? "empty"
+            : "no ggml-*.bin — found instead: \(others.prefix(5).joined(separator: ", "))"
     }
 }

@@ -29,22 +29,64 @@ fi
 ok "Homebrew"
 
 step "Installing whisper.cpp"
-if command -v whisper-cli >/dev/null 2>&1; then
-  ok "already installed"
+# Look in the Homebrew prefixes as well as $PATH: Murmur resolves the binary by
+# absolute path, so "on $PATH" and "installed" are not the same question, and
+# answering the wrong one here means the app falls back to a hosted API.
+find_whisper() {
+  local d n
+  for d in "$(brew --prefix 2>/dev/null)/bin" /opt/homebrew/bin /usr/local/bin; do
+    for n in whisper-cli whisper-cpp whisper; do
+      [[ -x "$d/$n" ]] && { echo "$d/$n"; return 0; }
+    done
+  done
+  command -v whisper-cli 2>/dev/null && return 0
+  return 1
+}
+
+WHISPER_BIN="$(find_whisper || true)"
+if [[ -n "$WHISPER_BIN" ]]; then
+  ok "already installed ($WHISPER_BIN)"
 else
   brew install whisper-cpp || { warn "brew install failed"; exit 1; }
-  ok "installed"
+  WHISPER_BIN="$(find_whisper || true)"
+  [[ -n "$WHISPER_BIN" ]] || { warn "brew reported success but no whisper binary was found"; exit 1; }
+  ok "installed ($WHISPER_BIN)"
 fi
 
 step "Downloading the speech model (~465 MB, once)"
 mkdir -p "$MODEL_DIR"
-if [[ -f "$MODEL" ]] && [[ $(stat -f%z "$MODEL" 2>/dev/null || echo 0) -gt 400000000 ]]; then
+
+# A real whisper model starts with the four bytes "ggml". Checking that, not
+# just the size, is what tells a model apart from an error page saved under a
+# .bin name — which is exactly what `curl` without -f leaves behind, while
+# still exiting 0 so every later run reports "model already present".
+model_is_valid() {
+  [[ -f "$1" ]] || return 1
+  [[ $(stat -f%z "$1" 2>/dev/null || echo 0) -gt 400000000 ]] || return 1
+  [[ $(head -c 4 "$1" 2>/dev/null) == "ggml" ]] || return 1
+}
+
+if model_is_valid "$MODEL"; then
   ok "model already present"
 else
-  curl -L --progress-bar -o "$MODEL" \
+  if [[ -f "$MODEL" ]]; then
+    warn "existing $MODEL is not a usable model (truncated or an error page) — removing it"
+    rm -f "$MODEL"
+  fi
+  # -f so an HTTP error is an error instead of a file full of HTML.
+  # -C - resumes a partial download instead of restarting the 465 MB.
+  curl -fL --progress-bar --retry 3 --retry-delay 2 -C - -o "$MODEL" \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin \
-    || { warn "download failed — rerun to resume"; exit 1; }
-  ok "downloaded"
+    || { warn "download failed — rerun to resume where it stopped"; exit 1; }
+
+  if ! model_is_valid "$MODEL"; then
+    warn "downloaded file is not a valid model. Removing it so a rerun starts clean."
+    warn "If this keeps happening, download it by hand from:"
+    warn "  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+    rm -f "$MODEL"
+    exit 1
+  fi
+  ok "downloaded and verified"
 fi
 
 step "Setting up a stable signing identity"

@@ -481,11 +481,22 @@ If real speech is being dropped, lower `min_peak_level` (try `0.15`). If silence
 still produces text, raise it (try `0.30`). The log tells you which gate fired
 and the measured peak, so tune against real numbers rather than guessing.
 
-**Groq returns "Access denied. Please check your network settings."**
-Groq blocks VPN and datacenter IPs on `/chat/completions` — the `/v1/models`
-endpoint still answers, which makes it look like a key problem when it isn't.
-No header or retry gets past it. This is handled automatically: see the fallback
-chain below.
+**Groq returns "Access denied. Please check your network settings." (403)**
+Groq blocks VPN, datacenter and some regional IPs. No header, no retry and no
+new key gets past it — the key was never the problem. It usually shows up on
+`/chat/completions` while `/v1/models` still answers, which is what makes it
+read like a key problem, but a hard block returns 403 on both.
+
+**A 403 is not a 401.** 401 means the key is wrong; 403 means the provider knows
+who you are and still won't serve this network. `--doctor` reads the response
+body to tell them apart and says which one you have, because regenerating a
+perfectly good key is the standard way to lose an hour here.
+
+Handled automatically at both stages: cleanup retries with `fallback_provider`,
+and transcription moves to the next backend in its plan. But if the only
+transcription backend you have is a blocked provider, there is nothing to fall
+back *to* — install the local model and the network stops being able to break
+dictation at all.
 
 **Mid-sentence language switching, and why the fallback model is `gpt-4o`.**
 If you switch languages mid-dictation ("…esto es lo que hago. Because I have to
