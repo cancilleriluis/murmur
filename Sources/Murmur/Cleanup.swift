@@ -49,6 +49,8 @@ struct Cleanup {
             }
         }
 
+        var host: String { endpoint(base: "").host ?? rawValue }
+
         func endpoint(base override: String) -> URL {
             var base = override.isEmpty ? defaultBase : override
             while base.hasSuffix("/") { base.removeLast() }
@@ -211,7 +213,9 @@ struct Cleanup {
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
             let msg = String(data: data, encoding: .utf8) ?? ""
-            throw TranscriptionError.apiFailed("HTTP \(code): \(String(msg.prefix(300)))")
+            throw NetworkDiagnostics.error(status: code, body: msg,
+                                           provider: provider.rawValue,
+                                           host: req.url?.host ?? provider.rawValue)
         }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw TranscriptionError.emptyResult

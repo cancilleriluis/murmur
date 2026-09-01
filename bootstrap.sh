@@ -79,7 +79,12 @@ cat <<'EOF'
      Never commit that file.
 
   Hold the push-to-talk key (Left Option by default), speak, release.
-  Verify anything without the mic or hotkey:
+
+  If anything misbehaves, this prints exactly which step is broken —
+  config, local model, keys, live network, permissions:
+     /Applications/Murmur.app/Contents/MacOS/Murmur --doctor
+
+  Or run the transcribe -> cleanup path against a file, no mic or hotkey needed:
      /Applications/Murmur.app/Contents/MacOS/Murmur --test-pipeline some.wav
 
 EOF

@@ -178,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 Log.write("Pipeline failed: \(error.localizedDescription)")
+                Log.write("Run `/Applications/Murmur.app/Contents/MacOS/Murmur --doctor` to see which step is broken.")
                 DispatchQueue.main.async {
                     self.isProcessing = false
                     self.flashError(Self.shortError(error))
@@ -186,7 +187,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The pill fits about four words. Truncating `localizedDescription` at 31
+    /// characters turned every hosted-API failure into the same unreadable
+    /// stump, so the typed errors carry their own short form and the full
+    /// explanation — which is the part that names the fix — goes to the log.
     private static func shortError(_ error: Error) -> String {
+        if let known = error as? TranscriptionError { return known.pillMessage }
         let msg = error.localizedDescription
         return msg.count > 34 ? String(msg.prefix(31)) + "…" : msg
     }
@@ -225,19 +231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        // Status line: which backend will actually be used.
+        // Status line: the real plan, in order, so a silent fallback to a
+        // hosted API is visible before it fails rather than after.
         let t = Transcriber(config: cfg)
-        let backendLabel: String
-        switch cfg.transcription_backend.lowercased() {
-        case "local":  backendLabel = t.localIsAvailable() ? "Local whisper.cpp" : "Local (model missing!)"
-        case "groq":   backendLabel = "Groq API"
-        case "openai": backendLabel = "OpenAI API"
-        default:
-            if t.localIsAvailable() { backendLabel = "Local whisper.cpp (auto)" }
-            else if Env.get("GROQ_API_KEY") != nil { backendLabel = "Groq API (auto)" }
-            else if Env.get("OPENAI_API_KEY") != nil { backendLabel = "OpenAI API (auto)" }
-            else { backendLabel = "⚠︎ No backend configured" }
-        }
+        let plan = t.backendPlan()
+        let backendLabel = plan.isEmpty
+            ? "⚠︎ No backend available"
+            : plan.map { $0.label }.joined(separator: " → ")
         let info = NSMenuItem(title: backendLabel, action: nil, keyEquivalent: "")
         info.isEnabled = false
         menu.addItem(info)
@@ -375,6 +375,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                action: #selector(checkPermissions), keyEquivalent: "")
         perms.target = self
         menu.addItem(perms)
+
+        let diagnose = NSMenuItem(title: "Run Diagnostics…",
+                                  action: #selector(runDiagnostics), keyEquivalent: "")
+        diagnose.target = self
+        menu.addItem(diagnose)
 
         menu.addItem(.separator())
 
@@ -526,6 +531,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Same report as `--doctor`, for people who never open a terminal. It
+    /// makes live API requests, so it runs off the main thread and the menu
+    /// stays responsive.
+    @objc private func runDiagnostics() {
+        work.async {
+            let url = Doctor.writeReport()
+            DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+        }
+    }
+
     private func showPermissionAlert() {
         let alert = NSAlert()
         alert.messageText = "Murmur needs Input Monitoring"
@@ -578,6 +593,13 @@ enum LaunchAtLogin {
 }
 
 // MARK: - Entry point
+
+/// `Murmur --doctor` walks the whole pipeline — config, local model, keys,
+/// live network, permissions — and prints what it found at every step. Run this
+/// first whenever dictation stops working.
+if CommandLine.arguments.contains("--doctor") {
+    exit(Doctor.run())
+}
 
 /// `Murmur --test-pipeline <file.wav>` runs the real transcribe → cleanup path
 /// against a WAV and prints both stages, without touching the mic, the hotkey,

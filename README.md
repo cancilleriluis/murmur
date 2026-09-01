@@ -91,8 +91,18 @@ curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.
 curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin
 ```
 
-Murmur auto-detects both `whisper-cli` and the model — no config needed. If
-several models are present it picks the largest.
+Murmur auto-detects both `whisper-cli` and the model — no config needed. Any
+`ggml-*.bin` in that directory counts, including `large-v3`, quantized `-q5_1`
+builds and `distil-` builds; if several are present it picks the largest, and
+ignores anything under 1 MB so a half-finished download never wins. Set
+`whisper_model_path` to a file to pin one, or to a directory to search there
+instead.
+
+`whisper-cli` is looked for in the Homebrew prefixes (Apple Silicon and Intel),
+MacPorts, `~/.local/bin`, and `$PATH`, under each of the names the formula has
+used (`whisper-cli`, `whisper-cpp`, `whisper`). Run `--doctor` to see which one
+it resolved — a miss here is otherwise invisible, and pushes every dictation
+onto a hosted API.
 
 > English-only variants (`ggml-small.en.bin`) are a bit sharper if you only ever
 > dictate in English.
@@ -266,6 +276,27 @@ gpt-4o serves you at ~2.5 s when it's on, with no configuration change.
 its own host, since pointing it at the primary's unreachable host would just
 fail the same way.
 
+**Transcription has its own chain**, and unlike cleanup a failure there is
+fatal — no fallback means no text at all. The order depends on what you asked
+for:
+
+| `transcription_backend` | Order tried |
+|---|---|
+| `"auto"` (default) | local, if a model is installed — **and nothing else**. With no local model: Groq → OpenAI |
+| `"local"` | local only |
+| `"groq"` | Groq → local → OpenAI |
+| `"openai"` | OpenAI → local → Groq |
+
+A working local model is deliberately a chain of one. The privacy promise at the
+top of this README is that a local setup makes no network calls, so Murmur will
+not start uploading your audio because whisper.cpp had a bad day — it reports the
+local failure instead. The chaining only kicks in for a hosted backend you
+actually chose, and there local is the *first* fallback, because it is the one
+thing a VPN, an expired key, or a provider outage cannot refuse.
+
+The menu-bar status line shows the live plan (`groq → local whisper.cpp`), so a
+silent fallback is visible before it costs you a dictation.
+
 ### Fully offline cleanup with Ollama
 
 `base_url` points at any OpenAI-compatible server, so the cleanup stage can run
@@ -350,12 +381,68 @@ to `right_option`.
 - **Launch at Login** — registers via `SMAppService`
 - **Edit Settings… / Reload Settings / Show Log**
 - **Check Permissions…** — live status of all three grants
+- **Run Diagnostics…** — the full `--doctor` report, opened in TextEdit
 
 The icon changes while recording, so you always know if it's hot.
 
 ---
 
 ## Troubleshooting
+
+**Start here: `--doctor`.**
+
+```bash
+/Applications/Murmur.app/Contents/MacOS/Murmur --doctor
+```
+
+Or **Run Diagnostics…** from the menu-bar icon, which writes the same report to
+`~/.config/murmur/diagnostics.txt` and opens it. It walks the whole pipeline in
+order and prints what it actually found at each step: whether `config.json`
+parsed, which `whisper-cli` and which model were resolved (and what else is
+sitting in the models directory), which keys are present — masked, with their
+length, which is what catches a truncated paste — the transcription plan in
+order, a **live request to every provider that has a key**, and the state of
+each permission. It exits non-zero when it finds something blocking.
+
+The network check is two requests per provider on purpose. Listing models proves
+the host is reachable and the key is valid; a real one-token completion is what a
+blocked IP actually gets refused on. Groq is why: its `/v1/models` answers from
+any address while `/chat/completions` returns 403, so a check that only did the
+first would call a completely unusable setup healthy.
+
+**"API unreachable" / "API error" in the pill.**
+The pill has room for about four words; the sentence that names the fix is in
+`~/.config/murmur/murmur.log`. The two are different problems:
+
+| Pill | Means | Look at |
+|---|---|---|
+| `API unreachable` | The request never got an HTTP response, or the provider refused the *network* | VPN, proxy, DNS, corporate TLS interception, provider outage |
+| `API error` | The provider answered and said no | The key, the quota, the model name |
+
+The log line spells out which: `cannot resolve api.groq.com — DNS is failing`,
+`TLS to api.openai.com failed — something is intercepting HTTPS`, `Groq refused
+this IP address (403)`, `rejected the API key (401)`, and so on.
+
+If it says `API unreachable` and `--doctor` shows local whisper.cpp as
+`unavailable`, that is the actual bug — every dictation is going over the
+network because there is no local model to use. `./bootstrap.sh` fixes it, and
+after that a blocked API cannot stop dictation at all.
+
+**A key that looks right but gets rejected (401).**
+`.env` values are parsed strictly enough to break on things you cannot see. All
+of these now work, and all of them used to fail silently:
+
+```bash
+export GROQ_API_KEY=gsk_...      # the `export` prefix is stripped
+OPENAI_API_KEY="sk-..."          # quotes are stripped
+ANTHROPIC_API_KEY=sk-... # work  # trailing comments are stripped
+```
+
+Also stripped: a UTF-8 BOM (TextEdit adds one, and it renames the *first* key in
+the file so it is never found), and any whitespace, non-breaking space, or
+zero-width character inside a value — the usual souvenir of copying a key out of
+a web dashboard. `--doctor` prints each key's length; compare it against the
+provider's dashboard if you suspect a truncated paste.
 
 **Nothing happens when I hold the key.**
 First check whether *another app already owns that key*. Wispr Flow, Raycast and

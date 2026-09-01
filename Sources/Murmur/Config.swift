@@ -327,14 +327,47 @@ final class ConfigStore {
 enum Env {
     /// Reads a key from (1) the process environment, then (2) ~/.config/murmur/.env
     static func get(_ key: String) -> String? {
-        if let v = ProcessInfo.processInfo.environment[key], !v.isEmpty { return v }
+        if let v = ProcessInfo.processInfo.environment[key] {
+            let clean = sanitize(v)
+            if !clean.isEmpty { return clean }
+        }
         if let v = dotenv[key], !v.isEmpty { return v }
         return nil
+    }
+
+    /// True when a key exists but looks unusable (empty after sanitising, or a
+    /// leftover placeholder). Used by `--doctor` to say "you left it blank"
+    /// rather than "not set".
+    static func isPlaceholder(_ value: String) -> Bool {
+        let v = value.lowercased()
+        return v.isEmpty || v.hasPrefix("your") || v.hasPrefix("sk-xxx")
+            || v.contains("changeme") || v == "..." || v.hasPrefix("<")
     }
 
     private static var dotenv: [String: String] = loadDotenv()
 
     static func reload() { dotenv = loadDotenv() }
+
+    /// Characters that end up inside a pasted key and make an otherwise valid
+    /// key 401. A wrapped line in TextEdit, a non-breaking space copied out of
+    /// a web dashboard, or the zero-width joiner some consoles emit are all
+    /// invisible in an editor and all fatal to `Authorization: Bearer`.
+    private static let invisible: Set<Character> = [
+        "\u{00A0}", "\u{200B}", "\u{200C}", "\u{200D}", "\u{2060}", "\u{FEFF}",
+    ]
+
+    /// API keys never contain whitespace, so stripping it is always safe and
+    /// fixes the single most common cause of a "bad key" that looks correct.
+    static func sanitize(_ raw: String) -> String {
+        String(raw.filter { !$0.isWhitespace && !$0.isNewline && !invisible.contains($0) })
+    }
+
+    /// A shell-style name: A-Z, 0-9, underscore. Anything else means the line
+    /// was not a `KEY=value` assignment and should be skipped rather than
+    /// stored under a nonsense key.
+    private static func isValidName(_ name: String) -> Bool {
+        !name.isEmpty && name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+    }
 
     private static func loadDotenv() -> [String: String] {
         var result: [String: String] = [:]
@@ -342,17 +375,37 @@ enum Env {
                           URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
                               .appendingPathComponent(".env")]
         for url in candidates {
-            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            guard var text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            // TextEdit and every Windows editor prepend a BOM; without this the
+            // first key in the file is named "\u{FEFF}GROQ_API_KEY" and is
+            // therefore never found — which reads exactly like a missing key.
+            if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+
             for rawLine in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                var line = rawLine.trimmingCharacters(in: .whitespaces)
                 if line.isEmpty || line.hasPrefix("#") { continue }
+                // `export KEY=value` — how keys come out of a shell profile or
+                // a provider's copy-paste snippet. Without this the key is
+                // stored as "export GROQ_API_KEY" and never matches.
+                if line.hasPrefix("export ") {
+                    line = String(line.dropFirst("export ".count))
+                           .trimmingCharacters(in: .whitespaces)
+                }
                 guard let eq = line.firstIndex(of: "=") else { continue }
                 let key = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
                 var val = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-                if val.count >= 2, (val.hasPrefix("\"") && val.hasSuffix("\"")) ||
-                    (val.hasPrefix("'") && val.hasSuffix("'")) {
+
+                let quoted = val.count >= 2 &&
+                    ((val.hasPrefix("\"") && val.hasSuffix("\"")) ||
+                     (val.hasPrefix("'") && val.hasSuffix("'")))
+                if quoted {
                     val = String(val.dropFirst().dropLast())
+                } else if let hash = val.range(of: " #") {
+                    // Trailing comment on an unquoted value: `KEY=abc # work key`.
+                    val = String(val[..<hash.lowerBound])
                 }
+                val = sanitize(val)
+                guard isValidName(key), !val.isEmpty else { continue }
                 if result[key] == nil { result[key] = val }  // env file is lowest priority per key
             }
         }
