@@ -56,21 +56,39 @@ fi
 step "Downloading the speech model (~465 MB, once)"
 mkdir -p "$MODEL_DIR"
 
-# A real whisper model starts with the four bytes "ggml". Checking that, not
-# just the size, is what tells a model apart from an error page saved under a
-# .bin name — which is exactly what `curl` without -f leaves behind, while
-# still exiting 0 so every later run reports "model already present".
+# A real whisper model starts with magic 0x67676d6c written as a native-endian
+# uint32, so the bytes on disk are "lmgg" — NOT "ggml". Checking that, rather
+# than only the size, is what tells a model apart from an error page saved under
+# a .bin name: `curl` without -f writes the server's error body to the output
+# file and still exits 0, so every later run reports "model already present".
+model_magic_ok() {
+  local m
+  m=$(head -c 4 "$1" 2>/dev/null)
+  [[ "$m" == "lmgg" || "$m" == "GGUF" ]]
+}
+
+model_is_big_enough() {
+  [[ $(stat -f%z "$1" 2>/dev/null || echo 0) -gt 400000000 ]]
+}
+
 model_is_valid() {
-  [[ -f "$1" ]] || return 1
-  [[ $(stat -f%z "$1" 2>/dev/null || echo 0) -gt 400000000 ]] || return 1
-  [[ $(head -c 4 "$1" 2>/dev/null) == "ggml" ]] || return 1
+  [[ -f "$1" ]] && model_is_big_enough "$1" && model_magic_ok "$1"
 }
 
 if model_is_valid "$MODEL"; then
   ok "model already present"
 else
   if [[ -f "$MODEL" ]]; then
-    warn "existing $MODEL is not a usable model (truncated or an error page) — removing it"
+    # Only ever delete a file that is obviously a failed download. A large file
+    # whose magic looks wrong gets a warning and a stop: half a gigabyte the
+    # user waited for is not something to throw away on a heuristic.
+    if model_is_big_enough "$MODEL"; then
+      warn "$MODEL is $(stat -f%z "$MODEL") bytes but its header doesn't look like a model."
+      warn "NOT deleting it — check it by hand:  head -c 4 \"$MODEL\"   (expected: lmgg)"
+      warn "If it really is broken, delete it yourself and rerun this script."
+      exit 1
+    fi
+    warn "existing $MODEL is only $(stat -f%z "$MODEL" 2>/dev/null || echo 0) bytes — a failed download. Removing it."
     rm -f "$MODEL"
   fi
   # -f so an HTTP error is an error instead of a file full of HTML.
@@ -80,10 +98,10 @@ else
     || { warn "download failed — rerun to resume where it stopped"; exit 1; }
 
   if ! model_is_valid "$MODEL"; then
-    warn "downloaded file is not a valid model. Removing it so a rerun starts clean."
-    warn "If this keeps happening, download it by hand from:"
+    warn "the downloaded file is not a valid model. Leaving it in place for inspection:"
+    warn "  ls -la \"$MODEL\"  &&  head -c 4 \"$MODEL\"    (expected: lmgg)"
+    warn "Download it by hand if this keeps happening:"
     warn "  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
-    rm -f "$MODEL"
     exit 1
   fi
   ok "downloaded and verified"

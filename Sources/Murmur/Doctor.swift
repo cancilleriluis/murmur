@@ -391,13 +391,20 @@ final class Doctor {
             }
     }
 
-    /// whisper.cpp models start with the four bytes `ggml`. An HTML error page
-    /// saved under a .bin name does not.
+    /// True if the file starts with a whisper model's magic number.
+    ///
+    /// The magic is `0x67676d6c`, written as a **native-endian uint32** — so on
+    /// disk, on every machine this runs on, the bytes are `6c 6d 67 67` and the
+    /// file reads "lmgg", not "ggml". Comparing against the literal "ggml" is
+    /// the obvious mistake and it declares every real model corrupt. Newer
+    /// GGUF-packaged models are accepted too.
     static func looksLikeGGML(_ path: String) -> Bool {
         guard let handle = FileHandle(forReadingAtPath: path) else { return false }
         defer { try? handle.close() }
         guard let magic = try? handle.read(upToCount: 4), magic.count == 4 else { return false }
-        return magic.elementsEqual([0x67, 0x67, 0x6d, 0x6c])   // "ggml"
+        let ggml = Data([0x6c, 0x6d, 0x67, 0x67])   // 0x67676d6c little-endian, "lmgg"
+        let gguf = Data([0x47, 0x47, 0x55, 0x46])   // "GGUF"
+        return magic == ggml || magic == gguf
     }
 
     private func modelsDirSummary() -> String {
