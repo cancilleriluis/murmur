@@ -30,9 +30,18 @@ struct CleanupConfig: Codable {
     var fallback_provider: String = "openai"
     var fallback_model: String = "gpt-4o"
 
+    /// Seconds to wait for the primary provider before giving up on it.
+    ///
+    /// This is a latency setting, not a reliability one. Cleanup normally
+    /// answers in 0.4–2.5 s, so a provider still silent at 12 s is not about to
+    /// succeed — it is going to make you stare at the pill and then fall back
+    /// anyway. The old 30 s meant a single hung request cost 30 s, and a hung
+    /// primary plus a hung fallback cost a full minute for one dictation.
+    var timeout_seconds: Double = 12
+
     private enum CodingKeys: String, CodingKey {
         case enabled, provider, model, prompt, base_url, style
-        case fallback_provider, fallback_model
+        case fallback_provider, fallback_model, timeout_seconds
     }
 
     init() {}
@@ -48,6 +57,7 @@ struct CleanupConfig: Codable {
         style    = try c.decodeIfPresent(String.self, forKey: .style)    ?? "auto"
         fallback_provider = try c.decodeIfPresent(String.self, forKey: .fallback_provider) ?? "openai"
         fallback_model    = try c.decodeIfPresent(String.self, forKey: .fallback_model) ?? "gpt-4o"
+        timeout_seconds   = try c.decodeIfPresent(Double.self, forKey: .timeout_seconds) ?? 12
     }
 }
 
@@ -84,6 +94,40 @@ struct Config: Codable {
     var whisper_cli_path: String = ""
     /// Path to a ggml model file, e.g. ~/.config/murmur/models/ggml-small.bin
     var whisper_model_path: String = ""
+
+    /// Threads for whisper.cpp. 0 = the machine's performance-core count.
+    ///
+    /// Not "all the cores": on Apple Silicon the efficiency cores are far
+    /// slower per thread, and whisper splits work evenly, so every E-core
+    /// thread makes the whole batch wait on the slowest worker. Handing it
+    /// `activeProcessorCount - 2` measurably *hurt* on every M-series chip.
+    var whisper_threads: Int = 0
+
+    /// Beam width. 1 = greedy, which is what dictation wants.
+    ///
+    /// whisper-cli defaults to beam search with width 5, roughly doubling
+    /// decode time for an accuracy difference you cannot see on a clean
+    /// ten-second take into a text field. Raise it if you dictate in noise and
+    /// would rather wait.
+    var whisper_beam_size: Int = 1
+
+    /// Flash attention: "auto" (use it when the installed whisper-cli
+    /// advertises `-fa`), "on", or "off". Worth a solid speedup on Metal, but
+    /// older builds abort on the unknown flag — hence the probe.
+    var whisper_flash_attn: String = "auto"
+
+    /// Run one silent clip through whisper at launch.
+    ///
+    /// whisper.cpp compiles its Metal shaders on first use and caches them,
+    /// which is why the first dictation after every reboot or rebuild takes
+    /// ten-plus seconds while the rest take one. Paying that in the background
+    /// at startup means you never notice it.
+    var warm_up: Bool = true
+
+    /// Seconds to wait on a hosted transcription request. Beyond this the
+    /// backend plan moves on to the next backend, so it doubles as the delay
+    /// before a fallback can rescue you.
+    var api_timeout_seconds: Double = 25
 
     /// "auto" detects the spoken language; an ISO code like "es" pins it.
     var language: String = "auto"
@@ -146,6 +190,11 @@ struct Config: Codable {
         transcription_backend = try c.decodeIfPresent(String.self, forKey: .transcription_backend) ?? d.transcription_backend
         whisper_cli_path      = try c.decodeIfPresent(String.self, forKey: .whisper_cli_path) ?? d.whisper_cli_path
         whisper_model_path    = try c.decodeIfPresent(String.self, forKey: .whisper_model_path) ?? d.whisper_model_path
+        whisper_threads       = try c.decodeIfPresent(Int.self, forKey: .whisper_threads) ?? d.whisper_threads
+        whisper_beam_size     = try c.decodeIfPresent(Int.self, forKey: .whisper_beam_size) ?? d.whisper_beam_size
+        whisper_flash_attn    = try c.decodeIfPresent(String.self, forKey: .whisper_flash_attn) ?? d.whisper_flash_attn
+        warm_up               = try c.decodeIfPresent(Bool.self, forKey: .warm_up) ?? d.warm_up
+        api_timeout_seconds   = try c.decodeIfPresent(Double.self, forKey: .api_timeout_seconds) ?? d.api_timeout_seconds
         language              = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
         languages             = try c.decodeIfPresent([String].self, forKey: .languages) ?? d.languages
         cleanup               = try c.decodeIfPresent(CleanupConfig.self, forKey: .cleanup) ?? d.cleanup
@@ -163,6 +212,8 @@ struct Config: Codable {
 
     private enum CodingKeys: String, CodingKey {
         case hotkey, transcription_backend, whisper_cli_path, whisper_model_path
+        case whisper_threads, whisper_beam_size, whisper_flash_attn, warm_up
+        case api_timeout_seconds
         case language, languages, cleanup, history
         case insertion, restore_clipboard, keep_in_clipboard
         case min_recording_seconds, play_sounds, debug_hotkey

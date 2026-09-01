@@ -58,6 +58,8 @@ final class Doctor {
         row("cleanup", cfg.cleanup.enabled
             ? "on — provider=\(cfg.cleanup.provider), style=\(cfg.cleanup.style), fallback=\(cfg.cleanup.fallback_provider.isEmpty ? "none" : cfg.cleanup.fallback_provider)"
             : "off")
+        row("timeouts", String(format: "transcription %.0fs, cleanup %.0fs — how long a hung provider stalls a dictation",
+                               cfg.api_timeout_seconds, cfg.cleanup.timeout_seconds))
 
         // MARK: Local backend
         section("Local whisper.cpp")
@@ -68,6 +70,23 @@ final class Doctor {
         row("models dir", modelsDirSummary())
         let localReady = transcriber.localIsAvailable()
         row("status", localReady ? "READY — dictation works with no network at all" : "unavailable")
+        if localReady {
+            row("threads", "\(Transcriber.threadCount(config: cfg))  (performance cores; whisper_threads overrides)")
+            row("beam size", "\(max(1, cfg.whisper_beam_size))\(cfg.whisper_beam_size <= 1 ? "  (greedy — fastest)" : "  (beam search — slower)")")
+            if let cliPath = cli {
+                row("flash attn", Transcriber.useFlashAttention(config: cfg, cli: cliPath) ? "on" : "off (not supported by this whisper-cli, or disabled)")
+            }
+            // A real run, so "it feels slow" becomes a number. The first one
+            // after a reboot or rebuild includes the Metal shader compile and
+            // will be several seconds; the ones after it are the real figure.
+            if let seconds = transcriber.warmUp(force: true) {
+                row("speed", String(format: "%.2fs for a 0.5s clip%@", seconds,
+                                    seconds > 4 ? "  — SLOW. Rerun: if it stays high it is not the shader compile." : ""))
+                if seconds > 8 {
+                    problems.append(String(format: "Local transcription took %.1fs on a half-second clip. Try a smaller model, or pin whisper_threads.", seconds))
+                }
+            }
+        }
         if !localReady {
             notes.append("Local transcription is unavailable, so every dictation depends on a hosted API. `./bootstrap.sh` installs whisper.cpp and the model.")
         }

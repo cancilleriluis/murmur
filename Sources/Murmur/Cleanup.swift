@@ -181,7 +181,7 @@ struct Cleanup {
                       base: String, system: String, user: String) throws -> String {
         var req = URLRequest(url: provider.endpoint(base: base))
         req.httpMethod = "POST"
-        req.timeoutInterval = 30
+        req.timeoutInterval = max(3, config.cleanup.timeout_seconds)
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let payload: [String: Any]

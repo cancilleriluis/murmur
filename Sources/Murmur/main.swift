@@ -42,6 +42,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         Log.write("Murmur started. hotkey=\(store.config.hotkey) backend=\(store.config.transcription_backend)")
+
+        // Pay whisper's one-time Metal shader compile here, on the pipeline
+        // queue, rather than on the user's first dictation. Same queue on
+        // purpose: it guarantees this never runs alongside a real take.
+        let cfg = store.config
+        work.async { Transcriber(config: cfg).warmUp() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -131,9 +137,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             defer { try? FileManager.default.removeItem(at: result.url) }
             guard let self = self else { return }
 
+            let started = Date()
+            var tTranscribe = 0.0
             do {
                 let transcriber = Transcriber(config: config)
                 let raw = try transcriber.transcribe(wav: result.url)
+                tTranscribe = Date().timeIntervalSince(started)
                 let lang = transcriber.result.language
                 Log.write("transcript [\(lang)] (\(raw.count) chars): \(String(raw.prefix(120)))")
                 if config.filter_hallucinations, Transcriber.isLikelyHallucination(raw) {
@@ -153,9 +162,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
+                let cleanupStarted = Date()
                 let polished = Cleanup(config: config).polish(raw)
+                let tCleanup = Date().timeIntervalSince(cleanupStarted)
                 History.add(text: polished, language: lang,
                             duration: result.duration, config: config.history)
+
+                // Where the wait actually went. Without this line, "it's slow"
+                // is unanswerable: whisper, the cleanup LLM and a provider
+                // timing out before its fallback all look identical from the
+                // outside — you just watch the pill spin.
+                Log.write(String(format:
+                    "timing: %.2fs audio -> transcribe %.2fs + cleanup %.2fs = %.2fs total (%.1fx realtime)",
+                    result.duration, tTranscribe, tCleanup, tTranscribe + tCleanup,
+                    (tTranscribe + tCleanup) / max(result.duration, 0.01)))
 
                 DispatchQueue.main.async {
                     self.isProcessing = false

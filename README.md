@@ -171,7 +171,13 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
   "transcription_backend": "auto",   // auto | local | groq | openai
   "whisper_cli_path": "",            // empty = autodetect
   "whisper_model_path": "",          // empty = autodetect from models/
+  "whisper_threads": 0,              // 0 = performance cores only
+  "whisper_beam_size": 1,            // 1 = greedy; raise for noisy audio
+  "whisper_flash_attn": "auto",      // auto | on | off
+  "warm_up": true,                   // compile Metal shaders at launch
+  "api_timeout_seconds": 25,         // before falling back to the next backend
   "language": "auto",                // "auto" detects; "es"/"en"/… pins it
+                                     // pinning it also skips the retry decode
   "languages": ["es","en","it","pt"],// languages you actually speak
 
   "history": {
@@ -187,7 +193,8 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
     "prompt": "",                    // empty = built-in dictation prompt
     "base_url": "",                  // empty = provider default; primary only
     "fallback_provider": "openai",   // retried when the primary fails
-    "fallback_model": "gpt-4o"       // must not be a mini-tier model
+    "fallback_model": "gpt-4o",      // must not be a mini-tier model
+    "timeout_seconds": 12            // before giving up on the primary
   },
 
   "insertion": "paste",              // paste (⌘V at the caret)
@@ -512,9 +519,57 @@ transcribing.
 **Some apps ignore the paste.** Switch `"insertion"` to `"type"`. Slower, but it
 synthesizes real keystrokes and leaves the pasteboard alone entirely.
 
-**The first transcription takes ~10 seconds, then it's fast.** That's
-whisper.cpp compiling its Metal GPU shaders once and caching them. Measured on
-an M4 with `small`: first run 13 s, every run after 0.85–1.1 s for 8 s of audio
+**It's slow.**
+Read the `timing:` line the log writes after every dictation:
+
+```
+timing: 3.80s audio -> transcribe 1.05s + cleanup 0.42s = 1.47s total (0.4x realtime)
+```
+
+That splits the wait into the two halves that look identical from the outside.
+Then, in order of how much time they usually account for:
+
+- **The first run after a reboot or rebuild** is whisper.cpp compiling its Metal
+  shaders and caching them. Murmur now does this at launch on a silent clip
+  (`warm_up`), so it lands where nobody is waiting instead of on your first
+  dictation. The log says `warm-up: whisper ready in …`.
+- **`transcribe` is high on every take.** Check `--doctor`: it prints the thread
+  count, the beam size, and a measured `speed` figure for a real clip. The model
+  matters most — `small` is about 1 s for 8 s of audio on an M4, plain
+  `large-v3` is five to seven. Auto-selection already prefers the fast ones;
+  `whisper_model_path` overrides it.
+- **A doubled transcribe time** means the language allowlist fired: with
+  `"language": "auto"`, a detection outside `languages` is re-run from scratch
+  in your main language, so the take costs twice what it should. It is common
+  for speech that sits near a neighbouring language — Spanish heard as Galician
+  or Catalan. The log names it and tells you which of the two fixes you want.
+  Pinning `"language": "es"` skips detection entirely and is the single biggest
+  latency lever in the app.
+- **`cleanup` is high.** A hosted LLM adds 0.4–2.5 s. If it is much more than
+  that, the primary provider is timing out before the fallback gets its turn —
+  `cleanup.timeout_seconds` (12 s) caps that, and `--doctor` shows which
+  providers actually answer. Turning **AI Cleanup** off in the menu removes the
+  stage entirely.
+
+Measured on an M4 with `small`: first run 13 s, every run after 0.85–1.1 s for
+8 s of audio.
+
+### Speed settings
+
+| Setting | Default | Effect |
+|---|---|---|
+| `language` | `"auto"` | Pinning it (`"es"`) skips detection **and** the double-decode retry |
+| `whisper_beam_size` | `1` | Greedy. whisper-cli's own default is beam search at 5, roughly 2x the decode time |
+| `whisper_threads` | `0` | Auto = performance cores only. Efficiency-core threads hold the whole batch back |
+| `whisper_flash_attn` | `"auto"` | Passes `-fa` when the installed whisper-cli advertises it |
+| `warm_up` | `true` | Compiles the Metal shaders at launch instead of on your first dictation |
+| `api_timeout_seconds` | `25` | How long a hung transcription provider stalls before the fallback runs |
+| `cleanup.timeout_seconds` | `12` | Same, for the cleanup stage |
+
+The thread default is the one worth knowing about: it used to be
+`activeProcessorCount - 2`, which on Apple Silicon puts threads on efficiency
+cores. whisper splits work evenly, so the batch waits on its slowest worker and
+adding those threads makes it slower, not faster.
 (~9× real-time). Nothing to fix — just don't judge it on the first try.
 
 **Local transcription is slow.** `medium` is ~3× slower than `small`. Drop down

@@ -227,14 +227,52 @@ struct Transcriber {
         return dir.appendingPathComponent(best.name).path
     }
 
-    /// Size class, largest first. Unknown names score 0 and lose to any known
-    /// class, but still beat nothing at all.
+    /// Ranked for *dictation*, which means latency counts as much as accuracy.
+    ///
+    /// Not simply "biggest wins". A plain `large-v3` is the most accurate model
+    /// here and also the slowest by a wide margin — five to seven seconds for a
+    /// take that `small` handles in one — and a second-long pause after every
+    /// sentence is the thing that makes a push-to-talk tool unusable. So the
+    /// turbo builds (large-class quality at roughly small-class speed) rank
+    /// top, plain `large` sits below `small`, and anything you actually want
+    /// regardless of speed you pin with `whisper_model_path`.
     static func modelScore(_ filename: String) -> Int {
         let name = filename.lowercased()
-        let classes: [(String, Int)] = [("large", 5), ("medium", 4), ("small", 3),
+        if name.contains("turbo") { return 6 }
+        let classes: [(String, Int)] = [("medium", 5), ("small", 4), ("large", 3),
                                         ("base", 2), ("tiny", 1)]
         for (keyword, rank) in classes where name.contains(keyword) { return rank }
         return 0
+    }
+
+    /// Runs one short silent clip through whisper so the first real dictation
+    /// doesn't pay for the pipeline being cold.
+    ///
+    /// whisper.cpp compiles its Metal shaders the first time it runs and caches
+    /// them, and the model has to be read off disk. That is the whole reason
+    /// the first dictation after a reboot or a rebuild takes ten-plus seconds
+    /// while every one after it takes about one. Doing it at launch moves that
+    /// cost somewhere nobody is waiting.
+    ///
+    /// Returns how long it took, or nil if there was nothing to warm.
+    @discardableResult
+    func warmUp(force: Bool = false) -> Double? {
+        guard force || config.warm_up, localIsAvailable() else { return nil }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("murmur-warmup-\(UUID().uuidString).wav")
+        // Half a second of silence. whisper pads every clip to its 30 s window
+        // anyway, so this exercises the full encoder — which is the part that
+        // needs compiling — without recording anything.
+        guard (try? AudioRecorder.writeWav16k([Float](repeating: 0, count: 8000), to: url)) != nil else {
+            return nil
+        }
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let started = Date()
+        _ = try? runWhisper(wav: url, language: fallbackLanguage)
+        let elapsed = Date().timeIntervalSince(started)
+        Log.write(String(format: "warm-up: whisper ready in %.2fs", elapsed))
+        return elapsed
     }
 
     private func transcribeLocal(wav: URL) throws -> String {
@@ -256,7 +294,15 @@ struct Transcriber {
         // Detected a language the user doesn't speak — almost always a
         // misdetection on short or noisy audio. Redo it in their main language
         // rather than handing back Korean.
-        Log.write("detected '\(detected)' outside \(allowed) — retrying as '\(fallbackLanguage)'")
+        //
+        // This is the most expensive thing Murmur does: a second full decode,
+        // so the dictation takes twice as long. It fires more often than you
+        // would think for anyone whose speech sits near a neighbouring
+        // language — Spanish detected as Galician or Catalan, Portuguese as
+        // Spanish — so the log says outright how to stop paying for it.
+        Log.write("detected '\(detected)' outside \(allowed) — re-running as '\(fallbackLanguage)'. "
+                  + "That doubles transcription time; set \"language\": \"\(fallbackLanguage)\" in config.json "
+                  + "to skip detection, or add \"\(detected)\" to \"languages\" if you do speak it.")
         let second = try runWhisper(wav: wav, language: fallbackLanguage)
         result.language = fallbackLanguage
         return second.text
@@ -265,6 +311,67 @@ struct Transcriber {
     private struct WhisperRun {
         let text: String
         let detected: String
+    }
+
+    /// Performance cores, not every core.
+    ///
+    /// `hw.perflevel0` is the fast cluster on Apple Silicon; on Intel there is
+    /// only one level and this is just the core count. whisper splits the work
+    /// evenly across its threads, so a thread parked on an efficiency core
+    /// holds up the whole batch — which is exactly what
+    /// `activeProcessorCount - 2` was doing.
+    static func threadCount(config: Config) -> Int {
+        if config.whisper_threads > 0 { return config.whisper_threads }
+        if let perf = sysctlInt("hw.perflevel0.logicalcpu"), perf > 0 { return perf }
+        return max(2, min(8, ProcessInfo.processInfo.activeProcessorCount))
+    }
+
+    private static func sysctlInt(_ name: String) -> Int? {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return nil }
+        return Int(value)
+    }
+
+    /// Whether to pass `-fa`. Older whisper-cli builds abort on an unknown
+    /// flag, which would turn a speedup into "transcription always fails", so
+    /// "auto" asks the installed binary what it supports and remembers the
+    /// answer for the life of the process.
+    static func useFlashAttention(config: Config, cli: String) -> Bool {
+        switch config.whisper_flash_attn.lowercased() {
+        case "on", "true", "yes": return true
+        case "off", "false", "no": return false
+        default: return cliSupportsFlag("-fa", cli: cli)
+        }
+    }
+
+    private static var flagSupportCache: [String: Bool] = [:]
+    private static let flagCacheLock = NSLock()
+
+    private static func cliSupportsFlag(_ flag: String, cli: String) -> Bool {
+        let key = "\(cli)\u{1}\(flag)"
+        flagCacheLock.lock()
+        if let cached = flagSupportCache[key] { flagCacheLock.unlock(); return cached }
+        flagCacheLock.unlock()
+
+        var supported = false
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: cli)
+        proc.arguments = ["--help"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        if (try? proc.run()) != nil {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            let help = String(data: data, encoding: .utf8) ?? ""
+            supported = help.contains(flag)
+        }
+
+        flagCacheLock.lock()
+        flagSupportCache[key] = supported
+        flagCacheLock.unlock()
+        return supported
     }
 
     private func runWhisper(wav: URL, language: String) throws -> WhisperRun {
@@ -277,14 +384,24 @@ struct Transcriber {
 
         // Note: `--no-prints` is deliberately absent — it also suppresses the
         // "auto-detected language:" line we need to parse.
-        let args = [
+        var args = [
             "-m", model,
             "-f", wav.path,
             "--no-timestamps",
-            "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2)),
+            "-t", String(Transcriber.threadCount(config: config)),
             "-l", language,
             "-otxt", "-of", wav.deletingPathExtension().path,
         ]
+
+        // Greedy by default. whisper-cli's own default is beam search with
+        // width 5, which roughly doubles decode time; `-bo` has to come down
+        // with it or the candidates are still generated.
+        let beam = max(1, config.whisper_beam_size)
+        args += ["-bs", String(beam), "-bo", String(beam)]
+
+        if Transcriber.useFlashAttention(config: config, cli: cli) {
+            args.append("-fa")
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cli)
@@ -357,7 +474,9 @@ struct Transcriber {
         if allowed.isEmpty || detected.isEmpty || allowed.contains(detected) {
             return first.text
         }
-        Log.write("API detected '\(detected)' outside \(allowed) — retrying as '\(fallbackLanguage)'")
+        Log.write("API detected '\(detected)' outside \(allowed) — re-running as '\(fallbackLanguage)'. "
+                  + "That doubles transcription time; set \"language\": \"\(fallbackLanguage)\" in config.json "
+                  + "to skip detection, or add \"\(detected)\" to \"languages\" if you do speak it.")
         let second = try callAPI(wav: wav, provider: provider, language: fallbackLanguage)
         result.language = fallbackLanguage
         return second.text
@@ -389,7 +508,7 @@ struct Transcriber {
 
         var req = URLRequest(url: provider.endpoint)
         req.httpMethod = "POST"
-        req.timeoutInterval = 60
+        req.timeoutInterval = max(5, config.api_timeout_seconds)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
@@ -578,10 +697,12 @@ enum HTTP {
         }
         task.resume()
 
-        // The wall-clock ceiling sits above the request's own timeoutInterval so
-        // URLSession normally reports the real reason first; this only catches a
-        // task that never calls back at all.
-        let ceiling = request.timeoutInterval > 0 ? request.timeoutInterval + 30 : 90
+        // The wall-clock ceiling sits just above the request's own
+        // timeoutInterval, so URLSession reports the real reason first and this
+        // only catches a task that never calls back at all. It used to add 30 s
+        // on top, which is 30 s of the user staring at the pill after the
+        // request has already given up.
+        let ceiling = request.timeoutInterval > 0 ? request.timeoutInterval + 5 : 30
         if sem.wait(timeout: .now() + ceiling) == .timedOut {
             // Without this the request keeps running (and holding the
             // connection) long after we've given up on it.
