@@ -91,7 +91,10 @@ final class Doctor {
             // Say which half is missing. "unavailable" on its own sent people
             // to rerun a bootstrap that had already done its job.
             if cli == nil {
-                problems.append("whisper-cli is not installed — `brew install whisper-cpp`. Until then every dictation needs a working API key and an unblocked network.")
+                // "brew install whisper-cpp" is not advice if brew itself is
+                // missing or off the PATH, which is the state that produced
+                // this in the first place.
+                problems.append("whisper-cli is not installed. \(Doctor.homebrewAdvice()) Until then every dictation needs a working API key and an unblocked network.")
             }
             if model == nil {
                 let stubs = suspiciousModelFiles()
@@ -389,6 +392,26 @@ final class Doctor {
                 if !Doctor.looksLikeGGML(path) { return "\(name) is not in ggml format" }
                 return nil
             }
+    }
+
+    /// Homebrew has three states worth telling apart, and only one of them is
+    /// fixed by "run brew install".
+    static func homebrewAdvice() -> String {
+        let fm = FileManager.default
+        let onPath = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .contains { fm.isExecutableFile(atPath: "\($0)/brew") }
+        let installed = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            .first { fm.isExecutableFile(atPath: $0) }
+
+        if onPath || installed != nil {
+            let brew = installed ?? "brew"
+            if !onPath, let path = installed {
+                return "Homebrew is installed at \(path) but is not on your PATH, which is why `brew` reports command-not-found. Run: `\(brew) install whisper-cpp` (and `echo 'eval \"$(\(path) shellenv)\"' >> ~/.zprofile` to fix your shell)."
+            }
+            return "Install it with `\(brew) install whisper-cpp`."
+        }
+        return "Homebrew is not installed either — get it from https://brew.sh, follow the 'Next steps' it prints, then `brew install whisper-cpp`."
     }
 
     /// True if the file starts with a whisper model's magic number.

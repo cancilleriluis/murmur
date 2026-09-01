@@ -22,11 +22,32 @@ if ! xcode-select -p >/dev/null 2>&1; then
 fi
 ok "Xcode Command Line Tools"
 
-if ! command -v brew >/dev/null 2>&1; then
-  warn "Homebrew not found. Install from https://brew.sh, then rerun."
+# `command -v brew` only answers "is brew on this shell's PATH", which is a
+# different question from "is Homebrew installed". On Apple Silicon it installs
+# to /opt/homebrew and does nothing to your PATH until you add its shellenv line
+# — so a perfectly good install reports "command not found" and this script used
+# to give up on it.
+BREW=""
+if command -v brew >/dev/null 2>&1; then
+  BREW="$(command -v brew)"
+else
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -x "$candidate" ]] && { BREW="$candidate"; break; }
+  done
+  if [[ -n "$BREW" ]]; then
+    warn "Homebrew is installed at $BREW but is not on your PATH."
+    warn "Using it anyway. To fix your shell permanently, run:"
+    warn "  echo 'eval \"\$($BREW shellenv)\"' >> ~/.zprofile && eval \"\$($BREW shellenv)\""
+  fi
+fi
+
+if [[ -z "$BREW" ]]; then
+  warn "Homebrew not found. Install it with:"
+  warn '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+  warn "Then follow the 'Next steps' it prints (they add brew to your PATH) and rerun this script."
   exit 1
 fi
-ok "Homebrew"
+ok "Homebrew ($BREW)"
 
 step "Installing whisper.cpp"
 # Look in the Homebrew prefixes as well as $PATH: Murmur resolves the binary by
@@ -34,7 +55,7 @@ step "Installing whisper.cpp"
 # answering the wrong one here means the app falls back to a hosted API.
 find_whisper() {
   local d n
-  for d in "$(brew --prefix 2>/dev/null)/bin" /opt/homebrew/bin /usr/local/bin; do
+  for d in "$("$BREW" --prefix 2>/dev/null)/bin" /opt/homebrew/bin /usr/local/bin; do
     for n in whisper-cli whisper-cpp whisper; do
       [[ -x "$d/$n" ]] && { echo "$d/$n"; return 0; }
     done
@@ -47,7 +68,7 @@ WHISPER_BIN="$(find_whisper || true)"
 if [[ -n "$WHISPER_BIN" ]]; then
   ok "already installed ($WHISPER_BIN)"
 else
-  brew install whisper-cpp || { warn "brew install failed"; exit 1; }
+  "$BREW" install whisper-cpp || { warn "brew install failed"; exit 1; }
   WHISPER_BIN="$(find_whisper || true)"
   [[ -n "$WHISPER_BIN" ]] || { warn "brew reported success but no whisper binary was found"; exit 1; }
   ok "installed ($WHISPER_BIN)"
