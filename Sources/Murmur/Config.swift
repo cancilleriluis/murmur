@@ -85,6 +85,16 @@ struct Config: Codable {
     /// Path to a ggml model file, e.g. ~/.config/murmur/models/ggml-small.bin
     var whisper_model_path: String = ""
 
+    /// Keep a `whisper-server` running with the model loaded instead of
+    /// launching `whisper-cli` per dictation. Saves the model load (often a
+    /// second or more) on every take, at the cost of keeping the model in RAM.
+    var whisper_server: Bool = true
+    /// Localhost port for that server.
+    var whisper_server_port: Int = 8178
+    /// 1 = greedy decoding (fast). whisper.cpp's own default is 5, which is a
+    /// little more accurate on hard audio and several times slower.
+    var whisper_beam_size: Int = 1
+
     /// "auto" detects the spoken language; an ISO code like "es" pins it.
     var language: String = "auto"
 
@@ -111,6 +121,12 @@ struct Config: Codable {
 
     /// Ignore accidental taps shorter than this many seconds.
     var min_recording_seconds: Double = 0.3
+
+    /// Keep the mic open this many seconds after a dictation, so the next one
+    /// starts instantly and doesn't clip the first syllable. The orange mic
+    /// indicator stays on meanwhile, and Bluetooth headsets stay in call mode.
+    /// 0 = close it as soon as you release the key.
+    var mic_warm_seconds: Double = 0
 
     /// Discard a take whose loudest moment never reaches this normalized level
     /// (0…1, where ~0.24 ≈ -38 dBFS). Whisper invents speech from room tone, so
@@ -146,6 +162,9 @@ struct Config: Codable {
         transcription_backend = try c.decodeIfPresent(String.self, forKey: .transcription_backend) ?? d.transcription_backend
         whisper_cli_path      = try c.decodeIfPresent(String.self, forKey: .whisper_cli_path) ?? d.whisper_cli_path
         whisper_model_path    = try c.decodeIfPresent(String.self, forKey: .whisper_model_path) ?? d.whisper_model_path
+        whisper_server        = try c.decodeIfPresent(Bool.self, forKey: .whisper_server) ?? d.whisper_server
+        whisper_server_port   = try c.decodeIfPresent(Int.self, forKey: .whisper_server_port) ?? d.whisper_server_port
+        whisper_beam_size     = try c.decodeIfPresent(Int.self, forKey: .whisper_beam_size) ?? d.whisper_beam_size
         language              = try c.decodeIfPresent(String.self, forKey: .language) ?? d.language
         languages             = try c.decodeIfPresent([String].self, forKey: .languages) ?? d.languages
         cleanup               = try c.decodeIfPresent(CleanupConfig.self, forKey: .cleanup) ?? d.cleanup
@@ -154,6 +173,7 @@ struct Config: Codable {
         restore_clipboard     = try c.decodeIfPresent(Bool.self, forKey: .restore_clipboard) ?? d.restore_clipboard
         keep_in_clipboard     = try c.decodeIfPresent(Bool.self, forKey: .keep_in_clipboard) ?? d.keep_in_clipboard
         min_recording_seconds = try c.decodeIfPresent(Double.self, forKey: .min_recording_seconds) ?? d.min_recording_seconds
+        mic_warm_seconds      = try c.decodeIfPresent(Double.self, forKey: .mic_warm_seconds) ?? d.mic_warm_seconds
         min_peak_level        = try c.decodeIfPresent(Double.self, forKey: .min_peak_level) ?? d.min_peak_level
         min_voiced_fraction   = try c.decodeIfPresent(Double.self, forKey: .min_voiced_fraction) ?? d.min_voiced_fraction
         filter_hallucinations = try c.decodeIfPresent(Bool.self, forKey: .filter_hallucinations) ?? d.filter_hallucinations
@@ -163,6 +183,7 @@ struct Config: Codable {
 
     private enum CodingKeys: String, CodingKey {
         case hotkey, transcription_backend, whisper_cli_path, whisper_model_path
+        case whisper_server, whisper_server_port, whisper_beam_size, mic_warm_seconds
         case language, languages, cleanup, history
         case insertion, restore_clipboard, keep_in_clipboard
         case min_recording_seconds, play_sounds, debug_hotkey
@@ -363,8 +384,13 @@ enum Env {
 // MARK: - Tiny file logger
 
 enum Log {
+    private static let lock = NSLock()
+    private static let stamp = ISO8601DateFormatter()
+
+    /// Called from the main thread, the audio queue and the pipeline at once.
     static func write(_ msg: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+        lock.lock(); defer { lock.unlock() }
+        let line = "[\(stamp.string(from: Date()))] \(msg)\n"
         FileHandle.standardError.write(line.data(using: .utf8) ?? Data())
         if let h = try? FileHandle(forWritingTo: Paths.logFile) {
             h.seekToEndOfFile(); h.write(line.data(using: .utf8) ?? Data()); try? h.close()

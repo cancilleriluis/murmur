@@ -161,6 +161,9 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
   "transcription_backend": "auto",   // auto | local | groq | openai
   "whisper_cli_path": "",            // empty = autodetect
   "whisper_model_path": "",          // empty = autodetect from models/
+  "whisper_server": true,            // keep the model loaded (see Speed below)
+  "whisper_server_port": 8178,
+  "whisper_beam_size": 1,            // 1 = greedy/fast; 5 = whisper.cpp default
   "language": "auto",                // "auto" detects; "es"/"en"/… pins it
   "languages": ["es","en","it","pt"],// languages you actually speak
 
@@ -185,6 +188,7 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
                                      // type (synthesize keystrokes)
   "restore_clipboard": true,
   "min_recording_seconds": 0.3,      // ignore accidental taps
+  "mic_warm_seconds": 0,             // keep the mic open after a take (see Speed)
   "play_sounds": false
 }
 ```
@@ -287,6 +291,40 @@ ollama pull llama3.2
 
 The same field works for LM Studio, llama.cpp's server, or any proxy.
 
+### Speed
+
+What happens between pressing the key and seeing text, and what keeps each
+step short:
+
+- **Pressing the key.** The pill appears on the keypress itself; the mic spins
+  up off the main thread, on one audio engine reused across dictations rather
+  than rebuilt each time. You can start the next dictation while the previous
+  one is still transcribing. They are inserted in the order you spoke them.
+- **Transcribing.** With local whisper.cpp, Murmur keeps one `whisper-server`
+  (installed with `brew install whisper-cpp`) running on `127.0.0.1` with the
+  model loaded. Before this, every dictation launched `whisper-cli` from
+  scratch and reloaded the ~0.5 GB model and Metal state, often adding a
+  second or more. The server stays warm, at the cost of keeping the model in
+  RAM. Set `"whisper_server": false` to go back to one process per dictation.
+  If the server fails, Murmur falls back to `whisper-cli` automatically. Its
+  output goes to `~/.config/murmur/whisper-server.log`.
+- **Decoding.** `whisper_beam_size: 1` (greedy) is several times faster than
+  whisper.cpp's default 5-beam search and barely differs on dictation. Set it
+  to `5` if you'd rather trade speed for accuracy on hard audio.
+- **Cleanup.** While you talk, Murmur opens the connection to the cleanup
+  provider, so the request after release skips the TLS handshake. A stalled
+  primary provider is abandoned after 10 s in favour of the fallback, instead
+  of after 30 s.
+- **Bluetooth mics / AirPods.** These take a second or two to switch into
+  microphone mode on every press. `"mic_warm_seconds": 60` keeps the mic open
+  for a minute after each dictation, so presses in that window start
+  instantly and include the quarter-second before you pressed. The downside is
+  that the orange mic indicator stays on for that long.
+
+Every dictation logs where the time went, e.g.
+`timing: release → text 0.84s (transcribe 0.41s, cleanup 0.38s)`, and
+`recording started (mic ready in 35 ms)`.
+
 ### Testing your setup
 
 ```bash
@@ -351,7 +389,9 @@ to `right_option`.
 - **Edit Settings… / Reload Settings / Show Log**
 - **Check Permissions…** — live status of all three grants
 
-The icon changes while recording, so you always know if it's hot.
+The icon becomes a filled capsule while recording, so you always know if it's hot.
+The status line under the toggle shows `· model loaded` once the local
+whisper-server is warm.
 
 ---
 

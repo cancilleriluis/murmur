@@ -8,12 +8,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = ConfigStore()
     private let hotkey = HotKeyMonitor()
     private let pill = RecordingPill()
-    private var recorder = AudioRecorder()
+    private let recorder = AudioRecorder()
 
     private var statusItem: NSStatusItem!
     private var isEnabled = true
     private var isRecording = false
-    private var isProcessing = false
+    /// Takes released but not yet inserted or discarded. You can start the
+    /// next dictation while earlier ones are still transcribing; `work` is
+    /// serial, so they still land in the order you spoke them.
+    private var pendingJobs = 0
     /// Kept so it can be re-copied from the menu if the paste went nowhere.
     private var lastTranscript: String = ""
 
@@ -26,6 +29,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         buildStatusItem()
         wireHotkey()
+
+        recorder.onLevel = { [weak self] level in self?.pill.update(level: level) }
+        recorder.setWarmSeconds(store.config.mic_warm_seconds)
+        // Loads the model in the background so the first dictation is fast too.
+        WhisperServer.shared.configure(store.config)
 
         // Ask for mic up front so the first dictation isn't eaten by a prompt.
         AudioRecorder.requestPermission { granted in
@@ -46,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         hotkey.stop()
+        WhisperServer.shared.stop()
     }
 
     // MARK: Hotkey wiring
@@ -60,8 +69,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Record → transcribe → clean → insert
 
     private func beginRecording() {
-        guard isEnabled, !isRecording, !isProcessing else {
-            Log.write("press ignored (enabled=\(isEnabled) recording=\(isRecording) processing=\(isProcessing))")
+        guard isEnabled, !isRecording else {
+            Log.write("press ignored (enabled=\(isEnabled) recording=\(isRecording))")
             return
         }
         guard AudioRecorder.hasPermission else {
@@ -72,18 +81,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        recorder = AudioRecorder()
-        recorder.onLevel = { [weak self] level in self?.pill.update(level: level) }
+        // Feedback first, hardware second: the pill answers the keypress
+        // itself, while the input device spins up off the main thread.
+        isRecording = true
+        pill.show(state: .recording)
+        refreshStatusIcon()
+        Prewarm.connections(for: store.config)
 
-        do {
-            try recorder.start()
-            isRecording = true
-            pill.show(state: .recording)
-            refreshStatusIcon()
-            Log.write("recording started")
-        } catch {
-            Log.write("Failed to start recording: \(error)")
-            flashError("Mic error")
+        let pressed = Date()
+        recorder.start { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let error = error {
+                    Log.write("Failed to start recording: \(error.localizedDescription)")
+                    if self.isRecording {
+                        self.isRecording = false
+                        self.refreshStatusIcon()
+                    }
+                    self.flashError("Mic error")
+                    return
+                }
+                Log.write(String(format: "recording started (mic ready in %.0f ms)",
+                                 Date().timeIntervalSince(pressed) * 1000))
+            }
         }
     }
 
@@ -91,97 +111,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isRecording else { return }
         isRecording = false
         refreshStatusIcon()
+        pendingJobs += 1
+        // Straight to "working": this take may queue behind an earlier one,
+        // and a discarded tap only flashes it for a moment.
+        pill.show(state: .working)
 
-        guard let result = recorder.stop() else {
+        let config = store.config
+        let released = Date()
+        recorder.stop { [weak self] take in
+            self?.work.async { self?.process(take, config: config, released: released) }
+        }
+    }
+
+    /// Runs on `work`, one take at a time.
+    private func process(_ take: AudioRecorder.Take?, config: Config, released: Date) {
+        guard let take = take else {
             Log.write("stopped — no usable audio captured (mic silent or blocked?)")
-            pill.hide()
+            finishJob()
             return
         }
+        defer { try? FileManager.default.removeItem(at: take.url) }
+
         // Ignore accidental taps.
-        guard result.duration >= store.config.min_recording_seconds else {
+        guard take.duration >= config.min_recording_seconds else {
             Log.write(String(format: "stopped — too short (%.2fs < %.2fs), discarded",
-                             result.duration, store.config.min_recording_seconds))
-            try? FileManager.default.removeItem(at: result.url)
-            pill.hide()
+                             take.duration, config.min_recording_seconds))
+            finishJob()
             return
         }
         // Silence gate — whisper invents speech from room tone, so a take that
         // never reached speech level must not reach it at all.
-        let peak = Double(recorder.peakLevel)
-        let voiced = recorder.voicedFraction
-        if store.config.min_peak_level > 0,
-           peak < store.config.min_peak_level || voiced < store.config.min_voiced_fraction {
+        let peak = Double(take.peakLevel)
+        let voiced = take.voicedFraction
+        if config.min_peak_level > 0,
+           peak < config.min_peak_level || voiced < config.min_voiced_fraction {
             Log.write(String(format:
                 "discarded — too quiet (peak %.2f < %.2f, voiced %.0f%% < %.0f%%). Mic muted or accidental tap?",
-                peak, store.config.min_peak_level,
-                voiced * 100, store.config.min_voiced_fraction * 100))
-            try? FileManager.default.removeItem(at: result.url)
-            pill.hide()
+                peak, config.min_peak_level,
+                voiced * 100, config.min_voiced_fraction * 100))
+            finishJob()
             return
         }
 
         Log.write(String(format: "recorded %.2fs (peak %.2f, voiced %.0f%%) — transcribing…",
-                         result.duration, peak, voiced * 100))
+                         take.duration, peak, voiced * 100))
 
-        isProcessing = true
-        pill.show(state: .working)
-        let config = store.config
+        do {
+            let t0 = Date()
+            let transcriber = Transcriber(config: config)
+            let raw = try transcriber.transcribe(wav: take.url)
+            let tTranscribe = Date().timeIntervalSince(t0)
+            let lang = transcriber.result.language
+            Log.write("transcript [\(lang)] (\(raw.count) chars): \(String(raw.prefix(120)))")
+            if config.filter_hallucinations, Transcriber.isLikelyHallucination(raw) {
+                Log.write("discarded — known whisper hallucination: \"\(raw)\"")
+                finishJob()
+                return
+            }
+            guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                Log.write("transcript empty — nothing to insert")
+                finishJob()
+                return
+            }
 
-        work.async { [weak self] in
-            defer { try? FileManager.default.removeItem(at: result.url) }
-            guard let self = self else { return }
+            let t1 = Date()
+            let polished = Cleanup(config: config).polish(raw)
+            let tCleanup = Date().timeIntervalSince(t1)
+            History.add(text: polished, language: lang,
+                        duration: take.duration, config: config.history)
+            Log.write(String(format: "timing: release → text %.2fs (transcribe %.2fs, cleanup %.2fs)",
+                             Date().timeIntervalSince(released), tTranscribe, tCleanup))
 
-            do {
-                let transcriber = Transcriber(config: config)
-                let raw = try transcriber.transcribe(wav: result.url)
-                let lang = transcriber.result.language
-                Log.write("transcript [\(lang)] (\(raw.count) chars): \(String(raw.prefix(120)))")
-                if config.filter_hallucinations, Transcriber.isLikelyHallucination(raw) {
-                    Log.write("discarded — known whisper hallucination: \"\(raw)\"")
-                    DispatchQueue.main.async {
-                        self.isProcessing = false
-                        self.pill.hide()
-                    }
-                    return
+            DispatchQueue.main.async {
+                self.lastTranscript = polished
+                let ax = TextInserter.hasAccessibility(prompt: false)
+                Log.write("inserting via \(config.insertion) — accessibility=\(ax ? "granted" : "NOT GRANTED (paste will silently fail)")")
+                // Keeping the text on the clipboard and restoring the old
+                // contents are mutually exclusive; keeping wins.
+                TextInserter.insert(polished,
+                                    using: config.insertion,
+                                    restoreClipboard: config.restore_clipboard
+                                                      && !config.keep_in_clipboard)
+                if config.keep_in_clipboard && config.insertion.lowercased() == "type" {
+                    // "type" never touches the pasteboard, so put it there now.
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(polished, forType: .string)
                 }
-                guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    Log.write("transcript empty — nothing to insert")
-                    DispatchQueue.main.async {
-                        self.isProcessing = false
-                        self.pill.hide()
-                    }
-                    return
-                }
+                self.rebuildMenu()
+            }
+            finishJob()
+        } catch {
+            Log.write("Pipeline failed: \(error.localizedDescription)")
+            finishJob(error: Self.shortError(error))
+        }
+    }
 
-                let polished = Cleanup(config: config).polish(raw)
-                History.add(text: polished, language: lang,
-                            duration: result.duration, config: config.history)
-
-                DispatchQueue.main.async {
-                    self.isProcessing = false
-                    self.pill.hide()
-                    self.lastTranscript = polished
-                    let ax = TextInserter.hasAccessibility(prompt: false)
-                    Log.write("inserting via \(config.insertion) — accessibility=\(ax ? "granted" : "NOT GRANTED (paste will silently fail)")")
-                    // Keeping the text on the clipboard and restoring the old
-                    // contents are mutually exclusive; keeping wins.
-                    TextInserter.insert(polished,
-                                        using: config.insertion,
-                                        restoreClipboard: config.restore_clipboard
-                                                          && !config.keep_in_clipboard)
-                    if config.keep_in_clipboard && config.insertion.lowercased() == "type" {
-                        // "type" never touches the pasteboard, so put it there now.
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(polished, forType: .string)
-                    }
-                    self.rebuildMenu()
-                }
-            } catch {
-                Log.write("Pipeline failed: \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    self.isProcessing = false
-                    self.flashError(Self.shortError(error))
-                }
+    /// Marks one take done (inserted, discarded or failed); safe from any
+    /// thread. The pill stays up while you're recording or anything is queued.
+    private func finishJob(error: String? = nil) {
+        DispatchQueue.main.async {
+            self.pendingJobs = max(0, self.pendingJobs - 1)
+            if self.isRecording { return }
+            if let error = error {
+                self.flashError(error)
+            } else if self.pendingJobs == 0 {
+                self.pill.hide()
             }
         }
     }
@@ -206,11 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshStatusIcon() {
         guard let button = statusItem.button else { return }
-        let name = isRecording ? "waveform.circle.fill"
-                 : (isEnabled ? "waveform" : "waveform.slash")
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "Murmur")
-        image?.isTemplate = true
-        button.image = image
+        button.image = WaveShape.menuBarImage(recording: isRecording, enabled: isEnabled)
     }
 
     private func rebuildMenu() {
@@ -227,13 +257,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Status line: which backend will actually be used.
         let t = Transcriber(config: cfg)
+        let serverTag = WhisperServer.shared.isReady ? " · model loaded" : ""
         let backendLabel: String
         switch cfg.transcription_backend.lowercased() {
-        case "local":  backendLabel = t.localIsAvailable() ? "Local whisper.cpp" : "Local (model missing!)"
+        case "local":  backendLabel = t.localIsAvailable() ? "Local whisper.cpp\(serverTag)" : "Local (model missing!)"
         case "groq":   backendLabel = "Groq API"
         case "openai": backendLabel = "OpenAI API"
         default:
-            if t.localIsAvailable() { backendLabel = "Local whisper.cpp (auto)" }
+            if t.localIsAvailable() { backendLabel = "Local whisper.cpp (auto)\(serverTag)" }
             else if Env.get("GROQ_API_KEY") != nil { backendLabel = "Groq API (auto)" }
             else if Env.get("OPENAI_API_KEY") != nil { backendLabel = "OpenAI API (auto)" }
             else { backendLabel = "⚠︎ No backend configured" }
@@ -405,9 +436,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleEnabled() {
         isEnabled.toggle()
         if !isEnabled, isRecording {
-            _ = recorder.stop()
+            recorder.cancel()
             isRecording = false
-            pill.hide()
+            if pendingJobs == 0 { pill.hide() }
         }
         refreshStatusIcon()
         rebuildMenu()
@@ -488,6 +519,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.reload()
         Env.reload()
         hotkey.setHotkey(store.config.hotkey)
+        hotkey.debugLogging = store.config.debug_hotkey
+        recorder.setWarmSeconds(store.config.mic_warm_seconds)
+        WhisperServer.shared.configure(store.config)
         rebuildMenu()
     }
 
@@ -591,10 +625,12 @@ if CommandLine.arguments.contains("--test-pipeline") {
     let wav = URL(fileURLWithPath: (args[idx + 1] as NSString).expandingTildeInPath)
     let cfg = ConfigStore.loadOrCreate()
     let t = Transcriber(config: cfg)
+    let serverUp = WhisperServer.shared.configureAndWait(cfg)
 
     print("backend      : \(cfg.transcription_backend)")
     print("whisper-cli  : \(t.resolvedWhisperCLI() ?? "(none)")")
     print("model        : \(t.resolvedModel() ?? "(none)")")
+    print("whisper-server: \(serverUp ? "running (model resident)" : "not used — whisper-cli per run")")
     let c = Cleanup(config: cfg)
     print("cleanup      : \(cfg.cleanup.enabled ? (c.resolveProvider().map { $0.rawValue } ?? "no API key — will pass through") : "disabled")")
     print("---")
@@ -609,6 +645,7 @@ if CommandLine.arguments.contains("--test-pipeline") {
         // real dictation would actually produce.
         if cfg.filter_hallucinations, Transcriber.isLikelyHallucination(raw) {
             print("FILTERED: discarded as a known whisper hallucination — nothing would be inserted.")
+            WhisperServer.shared.stop()
             exit(0)
         }
 
@@ -616,9 +653,11 @@ if CommandLine.arguments.contains("--test-pipeline") {
         let polished = c.polish(raw)
         let tClean = Date().timeIntervalSince(mid)
         print("CLEANED  (\(String(format: "%.2f", tClean))s): \(polished)")
+        WhisperServer.shared.stop()
         exit(0)
     } catch {
         print("FAILED: \(error.localizedDescription)")
+        WhisperServer.shared.stop()
         exit(1)
     }
 }

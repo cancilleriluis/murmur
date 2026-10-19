@@ -81,6 +81,16 @@ struct Transcriber {
         return candidates.first { fm.isExecutableFile(atPath: $0) }
     }
 
+    /// `whisper-server` installed next to `whisper-cli` (brew ships both).
+    func resolvedWhisperServer() -> String? {
+        guard let cli = resolvedWhisperCLI() else { return nil }
+        let p = URL(fileURLWithPath: cli).deletingLastPathComponent()
+            .appendingPathComponent("whisper-server").path
+        return FileManager.default.isExecutableFile(atPath: p) ? p : nil
+    }
+
+    static var threadCount: Int { max(4, ProcessInfo.processInfo.activeProcessorCount - 2) }
+
     func resolvedModel() -> String? {
         let fm = FileManager.default
         if !config.whisper_model_path.isEmpty {
@@ -129,6 +139,19 @@ struct Transcriber {
     }
 
     private func runWhisper(wav: URL, language: String) throws -> WhisperRun {
+        // Fast path: the resident server already has the model loaded.
+        if config.whisper_server, WhisperServer.shared.isReady {
+            do {
+                let r = try WhisperServer.shared.transcribe(wav: wav, language: language,
+                                                            beamSize: config.whisper_beam_size)
+                return WhisperRun(text: Transcriber.scrub(r.text),
+                                  detected: r.detected.isEmpty ? language : r.detected)
+            } catch {
+                Log.write("whisper-server failed (\(error.localizedDescription)) — falling back to whisper-cli")
+                WhisperServer.shared.recover()
+            }
+        }
+
         guard let cli = resolvedWhisperCLI() else {
             throw TranscriptionError.noBackendAvailable("whisper-cli not found (brew install whisper-cpp)")
         }
@@ -142,7 +165,10 @@ struct Transcriber {
             "-m", model,
             "-f", wav.path,
             "--no-timestamps",
-            "-t", String(max(4, ProcessInfo.processInfo.activeProcessorCount - 2)),
+            "-t", String(Transcriber.threadCount),
+            // whisper-cli defaults to a 5-beam search; greedy (1) is several
+            // times faster and barely differs on short dictation.
+            "-bs", String(max(1, config.whisper_beam_size)),
             "-l", language,
             "-otxt", "-of", wav.deletingPathExtension().path,
         ]
@@ -183,6 +209,20 @@ struct Transcriber {
     }
 
     // MARK: - Hosted Whisper (Groq / OpenAI)
+
+    /// The hosted provider `transcribe` would use, or nil when it runs locally.
+    func resolvedAPIProvider() -> Provider? {
+        switch config.transcription_backend.lowercased() {
+        case "local":  return nil
+        case "groq":   return .groq
+        case "openai": return .openai
+        default:
+            if localIsAvailable() { return nil }
+            if Env.get(Provider.groq.keyName) != nil { return .groq }
+            if Env.get(Provider.openai.keyName) != nil { return .openai }
+            return nil
+        }
+    }
 
     enum Provider {
         case groq, openai
@@ -227,32 +267,19 @@ struct Transcriber {
         guard let key = Env.get(provider.keyName) else {
             throw TranscriptionError.noBackendAvailable("\(provider.keyName) not set in ~/.config/murmur/.env")
         }
-        let audio = try Data(contentsOf: wav)
-
-        let boundary = "murmur-\(UUID().uuidString)"
-        var body = Data()
-        func field(_ name: String, _ value: String) {
-            body.append("--\(boundary)\r\n".data(using: .utf8)!)
-            body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
-            body.append("\(value)\r\n".data(using: .utf8)!)
-        }
-        field("model", provider.model)
+        var form = MultipartForm()
+        form.field("model", provider.model)
         // verbose_json also reports which language the model heard.
-        field("response_format", "verbose_json")
-        if let language = language, !language.isEmpty { field("language", language) }
-
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
-        body.append(audio)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        form.field("response_format", "verbose_json")
+        if let language = language, !language.isEmpty { form.field("language", language) }
+        form.file("file", filename: "audio.wav", type: "audio/wav", data: try Data(contentsOf: wav))
 
         var req = URLRequest(url: provider.endpoint)
         req.httpMethod = "POST"
         req.timeoutInterval = 60
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        req.httpBody = body
+        req.setValue(form.contentType, forHTTPHeaderField: "Content-Type")
+        req.httpBody = form.finalized()
 
         let (data, response) = try HTTP.sendSync(req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -371,11 +398,51 @@ enum HTTP {
             sem.signal()
         }
         task.resume()
-        _ = sem.wait(timeout: .now() + 90)
+        if sem.wait(timeout: .now() + request.timeoutInterval + 5) == .timedOut {
+            task.cancel()
+        }
         if let failure = failure { throw failure }
         guard let result = result else {
             throw TranscriptionError.apiFailed("request timed out")
         }
         return result
+    }
+}
+
+// MARK: - Connection pre-warming
+
+/// Opens the TLS connection to the hosts the pipeline is about to call while
+/// you are still talking, so the real request after release skips the
+/// DNS + TCP + TLS round trips (a few hundred ms on a cold connection).
+/// URLSession.shared keeps the connection alive for the request that follows.
+enum Prewarm {
+    private static let lock = NSLock()
+    private static var lastTouched: [String: Date] = [:]
+
+    static func connections(for config: Config) {
+        var urls: [URL] = []
+        if let p = Transcriber(config: config).resolvedAPIProvider() {
+            urls.append(p.endpoint)
+        }
+        if config.cleanup.enabled, let p = Cleanup(config: config).resolveProvider(), p != .local {
+            urls.append(p.endpoint(base: config.cleanup.base_url))
+        }
+        urls.forEach(touch)
+    }
+
+    private static func touch(_ url: URL) {
+        guard let host = url.host else { return }
+        lock.lock()
+        let recent = lastTouched[host].map { Date().timeIntervalSince($0) < 20 } ?? false
+        if !recent { lastTouched[host] = Date() }
+        lock.unlock()
+        if recent { return }
+
+        // Unauthenticated HEAD: the answer is an error and is ignored; only
+        // the open connection matters.
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 5
+        URLSession.shared.dataTask(with: req).resume()
     }
 }
