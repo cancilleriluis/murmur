@@ -23,6 +23,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingUpdate: Updater.Status?
     private var updateTimer: Timer?
 
+    /// Live transcription of the take being recorded, if enabled.
+    private var liveSession: LiveSession?
+    // Hands-free (double-tap) state.
+    private var pressedAt = Date.distantPast
+    private var lastTapEnded = Date.distantPast
+    private var lockedRecording = false
+    private var swallowRelease = false
+
+    private lazy var settingsWindow = SettingsWindowController(store: store) { [weak self] in
+        self?.applyConfig()
+    }
+    /// The "downloading model" menu item, retitled as progress comes in.
+    private weak var downloadItem: NSMenuItem?
+
     private let work = DispatchQueue(label: "murmur.pipeline", qos: .userInitiated)
 
     // MARK: Lifecycle
@@ -70,13 +84,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func wireHotkey() {
         hotkey.setHotkey(store.config.hotkey)
         hotkey.debugLogging = store.config.debug_hotkey
-        hotkey.onPress = { [weak self] in self?.beginRecording() }
-        hotkey.onRelease = { [weak self] in self?.endRecording() }
+        hotkey.onPress = { [weak self] in self?.handlePress() }
+        hotkey.onRelease = { [weak self] withModifier in self?.handleRelease(withModifier: withModifier) }
+    }
+
+    /// Hold to talk; double-tap to talk hands-free until the next tap.
+    private func handlePress() {
+        if lockedRecording {
+            lockedRecording = false
+            swallowRelease = true
+            endRecording(command: false)
+            return
+        }
+        let doubleTap = store.config.double_tap_lock
+            && Date().timeIntervalSince(lastTapEnded) < 0.35
+        pressedAt = Date()
+        beginRecording(locked: doubleTap)
+        if doubleTap && isRecording {
+            lockedRecording = true
+            swallowRelease = true
+            Log.write("hands-free: recording until the next tap")
+        }
+    }
+
+    private func handleRelease(withModifier: Bool) {
+        if swallowRelease {
+            swallowRelease = false
+            return
+        }
+        let held = Date().timeIntervalSince(pressedAt)
+        endRecording(command: withModifier && store.config.command_mode)
+        // A quick tap may be the first half of a double-tap.
+        if held < 0.3 { lastTapEnded = Date() }
     }
 
     // MARK: Record → transcribe → clean → insert
 
-    private func beginRecording() {
+    private func beginRecording(locked: Bool = false) {
         guard isEnabled, !isRecording else {
             Log.write("press ignored (enabled=\(isEnabled) recording=\(isRecording))")
             return
@@ -92,18 +136,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Feedback first, hardware second: the pill answers the keypress
         // itself, while the input device spins up off the main thread.
         isRecording = true
-        pill.show(state: .recording)
+        pill.show(state: locked ? .recordingLocked : .recording)
         refreshStatusIcon()
         Prewarm.connections(for: store.config)
 
+        // Long dictations are transcribed in pieces while you talk.
+        let session = store.config.live_transcription ? LiveSession(config: store.config) : nil
+        liveSession = session
+        var onPiece: (([Float], Double) -> Void)?
+        if let session = session {
+            onPiece = { samples, rate in session.submit(samples, rate: rate) }
+        }
+
         let pressed = Date()
-        recorder.start { [weak self] error in
+        recorder.start(onPiece: onPiece) { [weak self] error in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if let error = error {
                     Log.write("Failed to start recording: \(error.localizedDescription)")
                     if self.isRecording {
                         self.isRecording = false
+                        self.lockedRecording = false
                         self.refreshStatusIcon()
                     }
                     self.flashError("Mic error")
@@ -115,7 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func endRecording() {
+    private func endRecording(command: Bool) {
         guard isRecording else { return }
         isRecording = false
         refreshStatusIcon()
@@ -124,15 +177,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // and a discarded tap only flashes it for a moment.
         pill.show(state: .working)
 
-        let config = store.config
-        let released = Date()
+        let job = Job(config: store.config,
+                      released: Date(),
+                      app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                      command: command,
+                      live: liveSession)
+        liveSession = nil
         recorder.stop { [weak self] take in
-            self?.work.async { self?.process(take, config: config, released: released) }
+            self?.work.async { self?.process(take, job: job) }
         }
     }
 
+    /// Everything about one dictation that was decided when the key went up.
+    private struct Job {
+        let config: Config
+        let released: Date
+        /// Bundle ID of the app in front, for per-app formatting.
+        let app: String?
+        /// Command mode: rewrite the selection instead of inserting text.
+        let command: Bool
+        let live: LiveSession?
+    }
+
     /// Runs on `work`, one take at a time.
-    private func process(_ take: AudioRecorder.Take?, config: Config, released: Date) {
+    private func process(_ take: AudioRecorder.Take?, job: Job) {
+        let config = job.config
         guard let take = take else {
             Log.write("stopped — no usable audio captured (mic silent or blocked?)")
             finishJob()
@@ -161,15 +230,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        Log.write(String(format: "recorded %.2fs (peak %.2f, voiced %.0f%%) — transcribing…",
-                         take.duration, peak, voiced * 100))
+        // Command mode needs the selection before anything else can change it.
+        var selection: String?
+        if job.command {
+            selection = DispatchQueue.main.sync { TextInserter.copySelection() }
+            guard let selected = selection, !selected.isEmpty else {
+                Log.write("command mode: nothing selected")
+                finishJob(error: "Selecciona texto primero")
+                return
+            }
+        }
+
+        Log.write(String(format: "recorded %.2fs (peak %.2f, voiced %.0f%%, %d live pieces) — transcribing…",
+                         take.duration, peak, voiced * 100, take.pieces))
 
         do {
             let t0 = Date()
-            let transcriber = Transcriber(config: config)
-            let raw = try transcriber.transcribe(wav: take.url)
+            var raw = ""
+            var lang = ""
+            if take.pieces > 0, let live = job.live,
+               let joined = live.finish(tail: take.tail, rate: take.sampleRate) {
+                raw = joined.text
+                lang = joined.language
+            } else {
+                let transcriber = Transcriber(config: config)
+                raw = try transcriber.transcribe(wav: take.url)
+                lang = transcriber.result.language
+            }
             let tTranscribe = Date().timeIntervalSince(t0)
-            let lang = transcriber.result.language
             Log.write("transcript [\(lang)] (\(raw.count) chars): \(String(raw.prefix(120)))")
             if config.filter_hallucinations, Transcriber.isLikelyHallucination(raw) {
                 Log.write("discarded — known whisper hallucination: \"\(raw)\"")
@@ -183,39 +271,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             let t1 = Date()
-            let polished = Cleanup(config: config).polish(raw)
+            let cleanup = Cleanup(config: config)
+            let output: String
+            if let selected = selection {
+                guard let rewritten = cleanup.transform(selected, instruction: raw) else {
+                    Log.write("command mode: no rewrite (\(cleanup.isAvailable ? "provider failed" : "no API key"))")
+                    finishJob(error: cleanup.isAvailable ? "No se pudo reescribir" : "Modo comando necesita API key")
+                    return
+                }
+                Log.write("command \"\(raw)\" applied to \(selected.count) chars")
+                output = rewritten
+            } else {
+                let style = config.style(forApp: job.app)
+                Log.write("style \(style) for \(job.app ?? "unknown app")")
+                output = cleanup.polish(raw, style: style)
+                History.add(text: output, language: lang,
+                            duration: take.duration, config: config.history)
+            }
             let tCleanup = Date().timeIntervalSince(t1)
-            History.add(text: polished, language: lang,
-                        duration: take.duration, config: config.history)
             Log.write(String(format: "timing: release → text %.2fs (transcribe %.2fs, cleanup %.2fs)",
-                             Date().timeIntervalSince(released), tTranscribe, tCleanup))
+                             Date().timeIntervalSince(job.released), tTranscribe, tCleanup))
 
             DispatchQueue.main.async {
-                self.lastTranscript = polished
-                let ax = TextInserter.hasAccessibility(prompt: false)
-                var mode = config.insertion.lowercased()
-                var notice: String?
-                if !ax && mode != "clipboard" {
-                    // macOS drops synthetic ⌘V / keystrokes from an untrusted
-                    // app without any error, so the dictation would vanish.
-                    // Leave it on the clipboard instead and say so.
-                    mode = "clipboard"
-                    notice = "Sin Accesibilidad · pega con ⌘V"
-                    Log.write("accessibility NOT GRANTED — copied to clipboard instead of pasting. Use menu ▸ Arreglar permiso de Accesibilidad.")
-                } else {
-                    Log.write("inserting via \(mode) — accessibility=\(ax ? "granted" : "not needed")")
-                }
-                // Keeping the text on the clipboard and restoring the old
-                // contents are mutually exclusive; keeping wins.
-                TextInserter.insert(polished,
-                                    using: mode,
-                                    restoreClipboard: config.restore_clipboard
-                                                      && !config.keep_in_clipboard)
-                if config.keep_in_clipboard && mode == "type" {
-                    // "type" never touches the pasteboard, so put it there now.
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(polished, forType: .string)
-                }
+                self.lastTranscript = output
+                let notice = self.deliver(output, config: config)
                 self.rebuildMenu()
                 self.finishJob(error: notice)
             }
@@ -223,6 +302,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("Pipeline failed: \(error.localizedDescription)")
             finishJob(error: Self.shortError(error))
         }
+    }
+
+    /// Puts `text` at the caret; returns a notice for the pill when it could
+    /// only be copied. Main thread.
+    private func deliver(_ text: String, config: Config) -> String? {
+        let ax = TextInserter.hasAccessibility(prompt: false)
+        var mode = config.insertion.lowercased()
+        var notice: String?
+        if !ax && mode != "clipboard" {
+            // macOS drops synthetic ⌘V / keystrokes from an untrusted
+            // app without any error, so the dictation would vanish.
+            // Leave it on the clipboard instead and say so.
+            mode = "clipboard"
+            notice = "Sin Accesibilidad · pega con ⌘V"
+            Log.write("accessibility NOT GRANTED — copied to clipboard instead of pasting.")
+        } else {
+            Log.write("inserting via \(mode) — accessibility=\(ax ? "granted" : "not needed")")
+        }
+        // Keeping the text on the clipboard and restoring the old
+        // contents are mutually exclusive; keeping wins.
+        TextInserter.insert(text,
+                            using: mode,
+                            restoreClipboard: config.restore_clipboard
+                                              && !config.keep_in_clipboard)
+        if config.keep_in_clipboard && mode == "type" {
+            // "type" never touches the pasteboard, so put it there now.
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        }
+        return notice
     }
 
     /// Marks one take done (inserted, discarded or failed); safe from any
@@ -372,6 +481,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(styleParent)
 
         let langs = cfg.languages.isEmpty ? "todos" : cfg.languages.joined(separator: ", ")
+        // Voice model: what's installed, plus the big one to download.
+        let modelMenu = NSMenu()
+        let current = Transcriber(config: cfg).resolvedModel()
+        let autoItem = NSMenuItem(title: "Automático (el más grande instalado)",
+                                  action: #selector(selectModel(_:)), keyEquivalent: "")
+        autoItem.target = self
+        autoItem.representedObject = ""
+        autoItem.state = cfg.whisper_model_path.isEmpty ? .on : .off
+        modelMenu.addItem(autoItem)
+        modelMenu.addItem(.separator())
+        for url in ModelLibrary.installed() {
+            let item = NSMenuItem(title: ModelLibrary.label(url),
+                                  action: #selector(selectModel(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = url.path
+            item.state = url.path == current ? .on : .off
+            modelMenu.addItem(item)
+        }
+        if !ModelLibrary.hasTurbo {
+            modelMenu.addItem(.separator())
+            let title: String
+            if let p = ModelDownloader.shared.progress {
+                title = "Descargando large-v3-turbo… \(Int(p * 100)) %"
+            } else {
+                title = "Descargar large-v3-turbo (≈550 MB, más preciso)…"
+            }
+            let dl = NSMenuItem(title: title, action: #selector(downloadTurbo), keyEquivalent: "")
+            dl.target = self
+            dl.isEnabled = ModelDownloader.shared.progress == nil
+            modelMenu.addItem(dl)
+            downloadItem = dl
+        }
+        let modelParent = NSMenuItem(title: "Modelo de voz: \(current.map { ModelLibrary.label(URL(fileURLWithPath: $0)) } ?? "ninguno")",
+                                     action: nil, keyEquivalent: "")
+        menu.setSubmenu(modelMenu, for: modelParent)
+        menu.addItem(modelParent)
+
         let langInfo = NSMenuItem(title: "Idiomas: \(langs)", action: nil, keyEquivalent: "")
         langInfo.isEnabled = false
         menu.addItem(langInfo)
@@ -431,8 +577,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updates.target = self
         menu.addItem(updates)
 
-        let openConfig = NSMenuItem(title: "Edit Settings…",
-                                    action: #selector(openConfig), keyEquivalent: ",")
+        let undo = NSMenuItem(title: "Deshacer último dictado",
+                              action: #selector(undoLastDictation), keyEquivalent: "")
+        undo.target = self
+        undo.isEnabled = !lastTranscript.isEmpty
+        menu.addItem(undo)
+
+        let repaste = NSMenuItem(title: "Pegar otra vez el último dictado",
+                                 action: #selector(pasteLastAgain), keyEquivalent: "")
+        repaste.target = self
+        repaste.isEnabled = !lastTranscript.isEmpty
+        menu.addItem(repaste)
+
+        let tips = NSMenuItem(title: "Doble toque: manos libres · Tecla+⇧ con texto seleccionado: comando",
+                              action: nil, keyEquivalent: "")
+        tips.isEnabled = false
+        menu.addItem(tips)
+
+        menu.addItem(.separator())
+
+        let openConfig = NSMenuItem(title: "Ajustes…",
+                                    action: #selector(openSettings), keyEquivalent: ",")
         openConfig.target = self
         menu.addItem(openConfig)
 
@@ -481,6 +646,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !isEnabled, isRecording {
             recorder.cancel()
             isRecording = false
+            lockedRecording = false
+            liveSession = nil
             if pendingJobs == 0 { pill.hide() }
         }
         refreshStatusIcon()
@@ -556,6 +723,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openConfig() {
         NSWorkspace.shared.open(Paths.configFile)
+    }
+
+    @objc private func openSettings() {
+        settingsWindow.show()
+    }
+
+    @objc private func selectModel(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        store.update { $0.whisper_model_path = path }
+        applyConfig()
+    }
+
+    @objc private func downloadTurbo() {
+        ModelDownloader.shared.onProgress = { [weak self] in
+            guard let self = self, let p = ModelDownloader.shared.progress else { return }
+            self.downloadItem?.title = "Descargando large-v3-turbo… \(Int(p * 100)) %"
+        }
+        ModelDownloader.shared.downloadTurbo { [weak self] error in
+            guard let self = self else { return }
+            if let error = error {
+                Log.write("model download failed: \(error.localizedDescription)")
+                self.flashError("Descarga fallida")
+            } else {
+                Log.write("model downloaded — switching to large-v3-turbo")
+                let path = Paths.modelsDir.appendingPathComponent(ModelLibrary.turboName).path
+                self.store.update { $0.whisper_model_path = path }
+                self.applyConfig()
+            }
+            self.rebuildMenu()
+        }
+        rebuildMenu()
+    }
+
+    /// The menu closes first, so focus is back in the app you dictated into.
+    @objc private func undoLastDictation() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { TextInserter.sendUndo() }
+    }
+
+    @objc private func pasteLastAgain() {
+        let text = lastTranscript
+        let config = store.config
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            if let notice = self?.deliver(text, config: config) { self?.flashError(notice) }
+        }
+    }
+
+    /// Applies the saved settings to everything that caches them.
+    private func applyConfig() {
+        hotkey.setHotkey(store.config.hotkey)
+        hotkey.debugLogging = store.config.debug_hotkey
+        recorder.setWarmSeconds(store.config.mic_warm_seconds)
+        WhisperServer.shared.configure(store.config)
+        rebuildMenu()
     }
 
     @objc private func reloadConfig() {

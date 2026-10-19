@@ -30,9 +30,14 @@ struct CleanupConfig: Codable {
     var fallback_provider: String = "openai"
     var fallback_model: String = "gpt-4o"
 
+    /// Dictations shorter than this many words skip the LLM: whisper already
+    /// punctuates a short phrase fine, and the round trip is most of the wait.
+    /// Filler words are still stripped. 0 sends everything to the LLM.
+    var min_words: Int = 8
+
     private enum CodingKeys: String, CodingKey {
         case enabled, provider, model, prompt, base_url, style
-        case fallback_provider, fallback_model
+        case fallback_provider, fallback_model, min_words
     }
 
     init() {}
@@ -48,6 +53,7 @@ struct CleanupConfig: Codable {
         style    = try c.decodeIfPresent(String.self, forKey: .style)    ?? "auto"
         fallback_provider = try c.decodeIfPresent(String.self, forKey: .fallback_provider) ?? "openai"
         fallback_model    = try c.decodeIfPresent(String.self, forKey: .fallback_model) ?? "gpt-4o"
+        min_words         = try c.decodeIfPresent(Int.self, forKey: .min_words) ?? 8
     }
 }
 
@@ -106,6 +112,30 @@ struct Config: Codable {
 
     var cleanup: CleanupConfig = CleanupConfig()
     var history: HistoryConfig = HistoryConfig()
+
+    /// Names and terms whisper and the cleanup model should spell exactly so.
+    /// Whisper gets them as its prompt, the LLM as a spelling list.
+    var vocabulary: [String] = [
+        "OpenClaw", "Zentio", "GuardRailNow", "MIA", "Make.com", "Buffer",
+        "Gemini", "Claude", "Haiku", "Galicia",
+    ]
+
+    /// Formatting per app, picked from the app in front when you release the
+    /// key. Keys are bundle IDs; a key ending in "*" matches a prefix.
+    /// Styles: auto, clean, structured, casual, email, raw (no LLM at all).
+    /// Apps not listed use `cleanup.style`.
+    var app_styles: [String: String] = Config.defaultAppStyles
+
+    /// Transcribe long dictations in pieces at your pauses while you're still
+    /// talking, so only the last few seconds are left when you release.
+    var live_transcription: Bool = true
+
+    /// Double-tap the key to dictate hands-free; tap once more to stop.
+    var double_tap_lock: Bool = true
+
+    /// Hold the key together with ⇧ (or ⌃ when the key itself is a shift)
+    /// while text is selected, and say how to change it.
+    var command_mode: Bool = true
 
     /// "paste"     — clipboard + ⌘V, inserted at the caret (default)
     /// "clipboard" — copy only, never presses anything; you paste yourself
@@ -169,6 +199,11 @@ struct Config: Codable {
         languages             = try c.decodeIfPresent([String].self, forKey: .languages) ?? d.languages
         cleanup               = try c.decodeIfPresent(CleanupConfig.self, forKey: .cleanup) ?? d.cleanup
         history               = try c.decodeIfPresent(HistoryConfig.self, forKey: .history) ?? d.history
+        vocabulary            = try c.decodeIfPresent([String].self, forKey: .vocabulary) ?? d.vocabulary
+        app_styles            = try c.decodeIfPresent([String: String].self, forKey: .app_styles) ?? d.app_styles
+        live_transcription    = try c.decodeIfPresent(Bool.self, forKey: .live_transcription) ?? d.live_transcription
+        double_tap_lock       = try c.decodeIfPresent(Bool.self, forKey: .double_tap_lock) ?? d.double_tap_lock
+        command_mode          = try c.decodeIfPresent(Bool.self, forKey: .command_mode) ?? d.command_mode
         insertion             = try c.decodeIfPresent(String.self, forKey: .insertion) ?? d.insertion
         restore_clipboard     = try c.decodeIfPresent(Bool.self, forKey: .restore_clipboard) ?? d.restore_clipboard
         keep_in_clipboard     = try c.decodeIfPresent(Bool.self, forKey: .keep_in_clipboard) ?? d.keep_in_clipboard
@@ -185,6 +220,7 @@ struct Config: Codable {
         case hotkey, transcription_backend, whisper_cli_path, whisper_model_path
         case whisper_server, whisper_server_port, whisper_beam_size, mic_warm_seconds
         case language, languages, cleanup, history
+        case vocabulary, app_styles, live_transcription, double_tap_lock, command_mode
         case insertion, restore_clipboard, keep_in_clipboard
         case min_recording_seconds, play_sounds, debug_hotkey
         case min_peak_level, min_voiced_fraction, filter_hallucinations
@@ -261,12 +297,76 @@ struct Config: Codable {
     enumerators ("punto uno", "point two") — the numbering carries them.
     """ + cleanupLayout
 
+    static let cleanupStyleCasual = """
+
+    FORMATTING: this is a chat message. Keep it short and conversational, as \
+    prose: no title, no headings, no numbered lists, no sign-off. Keep the \
+    speaker's informal tone and slang.
+    """
+
+    static let cleanupStyleEmail = """
+
+    FORMATTING: this is the body of an email. Use short paragraphs separated \
+    by blank lines. Keep a greeting or sign-off only if the speaker said one — \
+    never add one. Use bullets only if the speaker clearly listed items.
+    """
+
     static func cleanupPrompt(style: String) -> String {
         switch style.lowercased() {
         case "clean":      return cleanupPromptBase + cleanupStyleClean
         case "structured": return cleanupPromptBase + cleanupStyleStructured
+        case "casual":     return cleanupPromptBase + cleanupStyleCasual
+        case "email":      return cleanupPromptBase + cleanupStyleEmail
         default:           return cleanupPromptBase + cleanupStyleAuto
         }
+    }
+
+    /// Command mode: rewrite selected text as the spoken instruction says.
+    static let commandPrompt = """
+    You edit text for the user. You get an INSTRUCTION they spoke and the TEXT \
+    they had selected. Apply the instruction to the text and output ONLY the \
+    resulting text — no preamble, no quotes, no explanation. Keep the text's \
+    language unless the instruction asks for a translation. Keep formatting \
+    (line breaks, lists) unless the instruction changes it.
+    """
+
+    static let defaultAppStyles: [String: String] = [
+        // Code and terminals: exactly what you said, no rewriting.
+        "com.microsoft.VSCode": "raw",
+        "com.todesktop.230313mzl4w4u92": "raw",     // Cursor
+        "dev.zed.Zed": "raw",
+        "com.apple.dt.Xcode": "raw",
+        "com.jetbrains.*": "raw",
+        "com.apple.Terminal": "raw",
+        "com.googlecode.iterm2": "raw",
+        "dev.warp.Warp-Stable": "raw",
+        "com.mitchellh.ghostty": "raw",
+        // Chat.
+        "com.tinyspeck.slackmacgap": "casual",
+        "net.whatsapp.WhatsApp": "casual",
+        "desktop.WhatsApp": "casual",
+        "ru.keepcoder.Telegram": "casual",
+        "com.hnc.Discord": "casual",
+        "com.apple.MobileSMS": "casual",
+        // Mail.
+        "com.apple.mail": "email",
+        "com.microsoft.Outlook": "email",
+        "com.superhuman.electron": "email",
+        "com.readdle.smartemail-Mac": "email",
+        // Notes: allowed to organize into title + points.
+        "notion.id": "auto",
+        "com.apple.Notes": "auto",
+        "md.obsidian": "auto",
+    ]
+
+    /// The cleanup style for the app with this bundle ID.
+    func style(forApp bundleID: String?) -> String {
+        guard let id = bundleID else { return cleanup.style }
+        if let exact = app_styles[id] { return exact }
+        for (key, value) in app_styles where key.hasSuffix("*") && id.hasPrefix(String(key.dropLast())) {
+            return value
+        }
+        return cleanup.style
     }
 
     static var defaultCleanupPrompt: String { cleanupPrompt(style: "auto") }
@@ -341,6 +441,7 @@ final class ConfigStore {
     func setHotkey(_ key: String) { config.hotkey = key; save() }
     func setInsertion(_ mode: String) { config.insertion = mode; save() }
     func setCleanupStyle(_ style: String) { config.cleanup.style = style; save() }
+    func update(_ change: (inout Config) -> Void) { change(&config); save() }
 }
 
 // MARK: - .env / environment loading

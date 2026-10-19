@@ -32,16 +32,7 @@ enum TextInserter {
     private static func pasteText(_ text: String, restoreClipboard: Bool) {
         let pb = NSPasteboard.general
 
-        // Snapshot every representation on the current item so we can put back
-        // images/RTF/files, not just plain text.
-        var snapshot: [(NSPasteboard.PasteboardType, Data)] = []
-        if restoreClipboard, let item = pb.pasteboardItems?.first {
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    snapshot.append((type, data))
-                }
-            }
-        }
+        let snapshot = restoreClipboard ? snapshotPasteboard(pb) : []
 
         pb.clearContents()
         pb.setString(text, forType: .string)
@@ -54,29 +45,69 @@ enum TextInserter {
         // Restore after the paste has been consumed. 400 ms is enough for
         // Electron apps, which read the pasteboard asynchronously.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            pb.clearContents()
-            guard !snapshot.isEmpty else { return }
-            let item = NSPasteboardItem()
-            for (type, data) in snapshot {
-                item.setData(data, forType: type)
-            }
-            pb.writeObjects([item])
+            restorePasteboard(pb, from: snapshot)
         }
     }
 
+    /// Every representation on the current item, so images/RTF/files come
+    /// back too, not just plain text.
+    private static func snapshotPasteboard(_ pb: NSPasteboard) -> [(NSPasteboard.PasteboardType, Data)] {
+        guard let item = pb.pasteboardItems?.first else { return [] }
+        return item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
+    }
+
+    private static func restorePasteboard(_ pb: NSPasteboard,
+                                          from snapshot: [(NSPasteboard.PasteboardType, Data)]) {
+        pb.clearContents()
+        guard !snapshot.isEmpty else { return }
+        let item = NSPasteboardItem()
+        for (type, data) in snapshot {
+            item.setData(data, forType: type)
+        }
+        pb.writeObjects([item])
+    }
+
+    /// The text selected in the frontmost app, read with a synthetic ⌘C;
+    /// the clipboard is put back afterwards. Nil when nothing is selected
+    /// (the copy never changes the clipboard). Blocks for up to ~0.3 s.
+    static func copySelection() -> String? {
+        let pb = NSPasteboard.general
+        let snapshot = snapshotPasteboard(pb)
+        let before = pb.changeCount
+        sendKey(0x08, flags: .maskCommand)              // kVK_ANSI_C
+        var copied: String?
+        for _ in 0..<30 {
+            usleep(10_000)
+            if pb.changeCount != before {
+                copied = pb.string(forType: .string)
+                break
+            }
+        }
+        if pb.changeCount != before { restorePasteboard(pb, from: snapshot) }
+        return copied
+    }
+
+    /// ⌘Z in the frontmost app — undoes a paste in practically every app.
+    static func sendUndo() {
+        sendKey(0x06, flags: .maskCommand)              // kVK_ANSI_Z
+    }
+
     private static func sendCommandV() {
+        sendKey(0x09, flags: .maskCommand)              // kVK_ANSI_V
+    }
+
+    private static func sendKey(_ key: CGKeyCode, flags: CGEventFlags) {
         guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
-        // Don't let our synthetic Cmd-V re-enter our own event tap logic.
+        // Don't let our synthetic keystroke re-enter our own event tap logic.
         source.setLocalEventsFilterDuringSuppressionState(
             [.permitLocalMouseEvents, .permitSystemDefinedEvents],
             state: .eventSuppressionStateSuppressionInterval)
 
-        let vKey: CGKeyCode = 0x09  // kVK_ANSI_V
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false)
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
         else { return }
-        down.flags = .maskCommand
-        up.flags = .maskCommand
+        down.flags = flags
+        up.flags = flags
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
     }

@@ -25,6 +25,12 @@ final class AudioRecorder {
         let peakLevel: Float
         /// Fraction of buffers that carried plausible speech energy.
         let voicedFraction: Double
+        /// Pieces already handed to `onPiece` while recording.
+        let pieces: Int
+        /// Audio after the last piece, at `sampleRate`; empty when nothing
+        /// spoken followed it.
+        let tail: [Float]
+        let sampleRate: Double
     }
 
     private var engine = AVAudioEngine()
@@ -46,7 +52,17 @@ final class AudioRecorder {
     private var voicedBuffers = 0
     private var totalBuffers = 0
 
+    // Live transcription: the take is cut at pauses into pieces.
+    private var onPiece: (([Float], Double) -> Void)?
+    private var pieceStart = 0          // index in `samples` where the current piece begins
+    private var quietFrames = 0         // consecutive quiet frames at the end
+    private var pieceVoiced = 0         // voiced buffers since `pieceStart`
+    private var pieceCount = 0
+
     private static let prerollSeconds = 0.25
+    /// A pause this long, after at least `minPieceSeconds` of audio, ends a piece.
+    private static let pauseSeconds = 0.5
+    private static let minPieceSeconds = 4.0
 
     /// Normalized 0…1 input level, emitted per captured buffer for the UI meter.
     var onLevel: ((Float) -> Void)?
@@ -91,8 +107,11 @@ final class AudioRecorder {
         }
     }
 
-    /// Starts capturing. `completion` runs on the audio queue with the error, if any.
-    func start(_ completion: @escaping (Error?) -> Void) {
+    /// Starts capturing. `onPiece` (called on the capture thread) receives
+    /// each piece cut at a pause; `completion` runs on the audio queue with
+    /// the error, if any.
+    func start(onPiece: (([Float], Double) -> Void)? = nil,
+               _ completion: @escaping (Error?) -> Void) {
         queue.async {
             self.cooldown?.cancel()
             self.cooldown = nil
@@ -102,6 +121,8 @@ final class AudioRecorder {
             self.prerollUsed = self.preroll.count
             self.preroll.removeAll(keepingCapacity: true)
             self.peakLevel = 0; self.voicedBuffers = 0; self.totalBuffers = 0
+            self.onPiece = onPiece
+            self.pieceStart = 0; self.quietFrames = 0; self.pieceVoiced = 0; self.pieceCount = 0
             self.isRecording = true
             self.lock.unlock()
 
@@ -131,6 +152,10 @@ final class AudioRecorder {
             let peak = self.peakLevel
             let voiced = self.totalBuffers == 0 ? 0
                 : Double(self.voicedBuffers) / Double(self.totalBuffers)
+            let pieces = self.pieceCount
+            let tail = self.pieceVoiced > 0 && self.pieceStart < captured.count
+                ? Array(captured[self.pieceStart...]) : []
+            self.onPiece = nil
             self.samples.removeAll(keepingCapacity: true)
             self.lock.unlock()
 
@@ -139,7 +164,8 @@ final class AudioRecorder {
             // Pre-roll is extra context for whisper, not time you held the key.
             let duration = Double(captured.count - skipped) / max(sr, 1)
             completion(AudioRecorder.writeTake(captured, rate: sr, duration: duration,
-                                               peak: peak, voiced: voiced))
+                                               peak: peak, voiced: voiced,
+                                               pieces: pieces, tail: tail))
         }
     }
 
@@ -148,6 +174,7 @@ final class AudioRecorder {
         queue.async {
             self.lock.lock()
             self.isRecording = false
+            self.onPiece = nil
             self.samples.removeAll(keepingCapacity: true)
             self.lock.unlock()
             self.scheduleCooldown()
@@ -249,16 +276,34 @@ final class AudioRecorder {
         peakLevel = max(peakLevel, level)
         totalBuffers += 1
         // ~-38 dBFS: above room tone and fan noise, below any real speech.
-        if level > 0.24 { voicedBuffers += 1 }
+        if level > 0.24 { voicedBuffers += 1; pieceVoiced += 1 }
+        // ~-40 dBFS and below counts as a pause.
+        quietFrames = level < 0.2 ? quietFrames + frames : 0
+        var piece: [Float]?
+        let rate = sourceSampleRate
+        let emit = onPiece
+        if emit != nil,
+           pieceVoiced >= 3,
+           quietFrames >= Int(rate * AudioRecorder.pauseSeconds),
+           samples.count - pieceStart >= Int(rate * AudioRecorder.minPieceSeconds) {
+            // Cut in the middle of the pause so neither side loses a syllable.
+            let cut = samples.count - quietFrames / 2
+            piece = Array(samples[pieceStart..<cut])
+            pieceStart = cut
+            pieceVoiced = 0
+            pieceCount += 1
+        }
         lock.unlock()
 
+        if let piece = piece { emit?(piece, rate) }
         onLevel?(level)
     }
 
     private static func writeTake(_ captured: [Float], rate: Double, duration: Double,
-                                  peak: Float, voiced: Double) -> Take? {
+                                  peak: Float, voiced: Double,
+                                  pieces: Int, tail: [Float]) -> Take? {
         if captured.count < 400 { return nil }
-        let resampled = resampleLinear(captured, from: rate, to: 16000)
+        let resampled = resample(captured, from: rate)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("murmur-\(UUID().uuidString).wav")
         do {
@@ -267,10 +312,53 @@ final class AudioRecorder {
             Log.write("WAV write failed: \(error)")
             return nil
         }
-        return Take(url: url, duration: duration, peakLevel: peak, voicedFraction: voiced)
+        return Take(url: url, duration: duration, peakLevel: peak, voicedFraction: voiced,
+                    pieces: pieces, tail: tail, sampleRate: rate)
     }
 
     // MARK: - DSP helpers
+
+    /// Mono float audio at `srcRate` → 16 kHz, with Apple's band-limited
+    /// converter. Plain linear interpolation folds everything above 8 kHz
+    /// back into the speech band as noise; this filters it out first.
+    static func resample(_ input: [Float], from srcRate: Double) -> [Float] {
+        let dstRate = 16000.0
+        if abs(srcRate - dstRate) < 1 || input.isEmpty { return input }
+        guard let inFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: srcRate,
+                                           channels: 1, interleaved: false),
+              let outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: dstRate,
+                                            channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: inFormat, to: outFormat),
+              let inBuffer = AVAudioPCMBuffer(pcmFormat: inFormat,
+                                              frameCapacity: AVAudioFrameCount(input.count)),
+              let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat,
+                                               frameCapacity: AVAudioFrameCount(Double(input.count) * dstRate / srcRate) + 4096),
+              let inData = inBuffer.floatChannelData
+        else { return resampleLinear(input, from: srcRate, to: dstRate) }
+
+        converter.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+        input.withUnsafeBufferPointer { src in
+            _ = memcpy(inData[0], src.baseAddress!, input.count * MemoryLayout<Float>.size)
+        }
+        inBuffer.frameLength = AVAudioFrameCount(input.count)
+
+        var fed = false
+        var error: NSError?
+        let status = converter.convert(to: outBuffer, error: &error) { _, outStatus in
+            if fed {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            fed = true
+            outStatus.pointee = .haveData
+            return inBuffer
+        }
+        guard status != .error, let outData = outBuffer.floatChannelData else {
+            Log.write("resampler failed (\(error?.localizedDescription ?? "unknown")) — using linear")
+            return resampleLinear(input, from: srcRate, to: dstRate)
+        }
+        return Array(UnsafeBufferPointer(start: outData[0], count: Int(outBuffer.frameLength)))
+    }
 
     static func resampleLinear(_ input: [Float], from srcRate: Double, to dstRate: Double) -> [Float] {
         if abs(srcRate - dstRate) < 1 { return input }

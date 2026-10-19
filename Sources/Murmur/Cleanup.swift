@@ -72,23 +72,69 @@ struct Cleanup {
         return nil
     }
 
-    /// Returns cleaned text, or the input unchanged if cleanup is off/unavailable.
-    func polish(_ transcript: String) -> String {
+    /// True when some provider can be called (a key is set, or it's local).
+    var isAvailable: Bool { resolveProvider() != nil }
+
+    /// Returns cleaned text, or the input unchanged if cleanup is off or
+    /// unavailable. `style` overrides `cleanup.style` (per-app formatting).
+    func polish(_ transcript: String, style requested: String? = nil) -> String {
         guard config.cleanup.enabled else { return transcript }
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return transcript }
 
-        guard let provider = resolveProvider() else { return transcript }
-        let model = config.cleanup.model.isEmpty ? provider.defaultModel : config.cleanup.model
-        let system = config.cleanup.prompt.isEmpty
-            ? Config.cleanupPrompt(style: config.cleanup.style)
-            : config.cleanup.prompt
+        let style = (requested ?? config.cleanup.style).lowercased()
+        if style == "raw" { return trimmed }
+        // A short phrase gains nothing from the LLM but its round trip.
+        let words = trimmed.split(whereSeparator: { $0.isWhitespace }).count
+        if words < config.cleanup.min_words && style != "structured" {
+            return Cleanup.stripFillers(trimmed)
+        }
 
-        // Primary, then the configured fallback. Groq refuses VPN and
-        // datacenter source IPs, so without this a VPN toggle silently drops
-        // you back to raw, unstructured transcripts with no visible error.
-        // `base_url` belongs to the primary provider only — pointing the
-        // fallback at the primary's host would just fail the same way.
+        let system = (config.cleanup.prompt.isEmpty
+            ? Config.cleanupPrompt(style: style)
+            : config.cleanup.prompt) + vocabularyNote
+        // Guard against a model that ignored instructions and answered the
+        // text instead of cleaning it: a wild length change means bail out.
+        // Structuring legitimately adds a title, numbers and newlines, so
+        // it gets more headroom before we call the output suspicious.
+        let upper = (style == "auto" || style == "structured") ? 3.5 : 2.5
+        let out = complete(system: system, user: trimmed) { cleaned in
+            let ratio = Double(cleaned.count) / Double(max(trimmed.count, 1))
+            if ratio > upper || ratio < 0.25 {
+                Log.write("cleanup output ratio \(String(format: "%.2f", ratio)) — rejected.")
+                return nil
+            }
+            return Cleanup.tidy(cleaned)
+        }
+        return out ?? transcript
+    }
+
+    /// Command mode: rewrites `text` the way the spoken `instruction` asks.
+    /// Nil when no provider is available or every attempt failed.
+    func transform(_ text: String, instruction: String) -> String? {
+        let user = "INSTRUCTION:\n\(instruction)\n\nTEXT:\n\(text)"
+        return complete(system: Config.commandPrompt + vocabularyNote, user: user) { $0 }
+    }
+
+    private var vocabularyNote: String {
+        let words = config.vocabulary.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !words.isEmpty else { return "" }
+        return "\n\nVOCABULARY: these names and terms are spelled exactly like this. "
+            + "When the text has something that sounds like one of them, use this spelling: "
+            + words.joined(separator: ", ") + "."
+    }
+
+    /// Primary provider, then the configured fallback. Groq refuses VPN and
+    /// datacenter source IPs, so without this a VPN toggle silently drops
+    /// you back to raw, unstructured transcripts with no visible error.
+    /// `base_url` belongs to the primary provider only — pointing the
+    /// fallback at the primary's host would just fail the same way.
+    /// `accept` vets each answer; nil moves on to the next provider.
+    private func complete(system: String, user: String,
+                          accept: (String) -> String?) -> String? {
+        guard let provider = resolveProvider() else { return nil }
+        let model = config.cleanup.model.isEmpty ? provider.defaultModel : config.cleanup.model
+
         var attempts: [(provider: Provider, model: String, base: String)] = [
             (provider, model, config.cleanup.base_url)
         ]
@@ -105,44 +151,36 @@ struct Cleanup {
             // When something is lined up behind this attempt, give up on a
             // stalled provider quickly rather than leaving you on the pill.
             let timeout: TimeInterval = index < attempts.count - 1 ? 10 : 30
-            if let out = attemptPolish(provider: attempt.provider, key: key,
-                                       model: attempt.model, base: attempt.base,
-                                       system: system, original: trimmed,
-                                       timeout: timeout) {
+            do {
+                let out = try call(provider: attempt.provider, key: key, model: attempt.model,
+                                   base: attempt.base, system: system, user: user,
+                                   timeout: timeout)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !out.isEmpty, let accepted = accept(out) else { continue }
                 if index > 0 {
                     Log.write("cleanup fell back to \(attempt.provider.rawValue)/\(attempt.model)")
                 }
-                return out
+                return accepted
+            } catch {
+                Log.write("\(attempt.provider.rawValue) cleanup failed: \(error.localizedDescription)")
             }
         }
-        return transcript
+        return nil
     }
 
-    /// One provider attempt. Returns nil when it failed or produced output the
-    /// guard rejects, so the caller can move on to the next provider.
-    private func attemptPolish(provider: Provider, key: String?, model: String,
-                               base: String, system: String,
-                               original trimmed: String, timeout: TimeInterval) -> String? {
-        do {
-            let out = try call(provider: provider, key: key, model: model,
-                               base: base, system: system, user: trimmed, timeout: timeout)
-            let cleaned = out.trimmingCharacters(in: .whitespacesAndNewlines)
-            if cleaned.isEmpty { return nil }
-            // Guard against a model that ignored instructions and answered the
-            // text instead of cleaning it: a wild length change means bail out.
-            // Structuring legitimately adds a title, numbers and newlines, so
-            // it gets more headroom before we call the output suspicious.
-            let ratio = Double(cleaned.count) / Double(max(trimmed.count, 1))
-            let upper = config.cleanup.style.lowercased() == "clean" ? 2.5 : 3.5
-            if ratio > upper || ratio < 0.25 {
-                Log.write("\(provider.rawValue) output ratio \(String(format: "%.2f", ratio)) — rejected.")
-                return nil
-            }
-            return Cleanup.tidy(cleaned)
-        } catch {
-            Log.write("\(provider.rawValue) cleanup failed: \(error.localizedDescription)")
-            return nil
+    private static let fillers: Set<String> = [
+        "um", "umm", "uh", "uhh", "uhm", "erm", "eh", "ehm", "em", "mmm", "hmm",
+    ]
+
+    /// Drops standalone filler words from a short phrase that skipped the LLM.
+    static func stripFillers(_ text: String) -> String {
+        let kept = text.split(separator: " ").filter { token in
+            !fillers.contains(token.lowercased().trimmingCharacters(in: .punctuationCharacters))
         }
+        let joined = kept.joined(separator: " ")
+            .replacingOccurrences(of: #"^[,\s]+"#, with: "", options: .regularExpression)
+        guard let first = joined.first else { return text }
+        return first.uppercased() + joined.dropFirst()
     }
 
     /// Deterministic clean-up of defects the models reliably leave behind.

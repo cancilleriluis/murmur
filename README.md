@@ -64,6 +64,42 @@ Settings live in `~/.config/murmur/config.json` and are also not in the repo, so
 each machine can have its own hotkey and provider. Copy that file too if you
 want identical behaviour on both.
 
+## Everyday use
+
+| Do this | What happens |
+|---|---|
+| **Hold the key**, talk, release | Text is cleaned and pasted where the cursor is |
+| **Double-tap the key** | Hands-free: keeps recording until you tap once more (a small dot shows in the pill) |
+| Select text, **hold the key + ⇧**, say an instruction | Command mode: "más formal", "tradúcelo al inglés", "hazlo una lista", "más corto"… rewrites the selection in place (needs a cleanup API key) |
+| Menu ▸ **Deshacer último dictado** | ⌘Z in the app you dictated into |
+| Menu ▸ **Pegar otra vez el último dictado** | Re-inserts it, e.g. after it landed in the wrong field |
+| Menu ▸ **Ajustes…** | Settings window: key, model, cleanup, vocabulary, hands-free, command mode |
+
+**Formatting follows the app you're in.** Code editors and terminals get exactly
+what you said (no AI rewrite); Slack, WhatsApp, Telegram and Messages get a
+casual chat message; Mail and Outlook get email paragraphs; Notion, Notes and
+Obsidian may organize enumerated points into a title + list. Everything else
+uses the default format. Edit `app_styles` in the JSON to change the mapping
+(bundle IDs; a key ending in `*` matches a prefix; styles `auto`, `clean`,
+`structured`, `casual`, `email`, `raw`).
+
+**Vocabulary.** Names and terms in `vocabulary` (editable in Ajustes) are given
+to whisper as its prompt and to the cleanup model as a spelling list, so
+"Zentio" stops coming back as "sentio".
+
+**Short phrases skip the AI.** Under `cleanup.min_words` (8) words, whisper's own
+punctuation is kept and only filler words are dropped — no network round trip.
+
+**Live transcription.** Long dictations are transcribed in pieces at your pauses
+while you talk, so on release only the last few seconds are left. If any piece
+fails, the whole recording is transcribed as before. `live_transcription: false`
+turns it off.
+
+**Better model.** Menu ▸ Modelo de voz ▸ *Descargar large-v3-turbo* fetches the
+5-bit large-v3-turbo (~550 MB) and switches to it: noticeably better on accents,
+names and mixed Spanish/English. Switch back to `small` from the same menu if
+the `timing:` lines in the log show it's too slow on your Mac.
+
 ## Updating
 
 Once installed, Murmur updates itself from its menu: it checks GitHub's `main`

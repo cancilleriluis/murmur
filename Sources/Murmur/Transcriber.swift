@@ -35,6 +35,13 @@ struct Transcriber {
 
     private var fallbackLanguage: String { allowed.first ?? "en" }
 
+    /// Vocabulary as whisper's initial prompt: it biases decoding toward
+    /// these spellings. Nil when there is none.
+    private var vocabularyPrompt: String? {
+        let words = config.vocabulary.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        return words.isEmpty ? nil : words.joined(separator: ", ") + "."
+    }
+
     /// Resolution order for `transcription_backend == "auto"`:
     /// local whisper.cpp (if binary + model present) -> Groq -> OpenAI.
     func transcribe(wav: URL) throws -> String {
@@ -98,7 +105,8 @@ struct Transcriber {
             return fm.fileExists(atPath: p) ? p : nil
         }
         // Prefer bigger models when several are present.
-        let preferred = ["ggml-medium.en.bin", "ggml-medium.bin",
+        let preferred = [ModelLibrary.turboName, "ggml-large-v3-turbo.bin",
+                         "ggml-medium.en.bin", "ggml-medium.bin",
                          "ggml-small.en.bin", "ggml-small.bin",
                          "ggml-base.en.bin", "ggml-base.bin"]
         for name in preferred {
@@ -143,7 +151,8 @@ struct Transcriber {
         if config.whisper_server, WhisperServer.shared.isReady {
             do {
                 let r = try WhisperServer.shared.transcribe(wav: wav, language: language,
-                                                            beamSize: config.whisper_beam_size)
+                                                            beamSize: config.whisper_beam_size,
+                                                            prompt: vocabularyPrompt)
                 return WhisperRun(text: Transcriber.scrub(r.text),
                                   detected: r.detected.isEmpty ? language : r.detected)
             } catch {
@@ -161,7 +170,7 @@ struct Transcriber {
 
         // Note: `--no-prints` is deliberately absent — it also suppresses the
         // "auto-detected language:" line we need to parse.
-        let args = [
+        var args = [
             "-m", model,
             "-f", wav.path,
             "--no-timestamps",
@@ -172,6 +181,7 @@ struct Transcriber {
             "-l", language,
             "-otxt", "-of", wav.deletingPathExtension().path,
         ]
+        if let prompt = vocabularyPrompt { args += ["--prompt", prompt] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cli)
@@ -272,6 +282,7 @@ struct Transcriber {
         // verbose_json also reports which language the model heard.
         form.field("response_format", "verbose_json")
         if let language = language, !language.isEmpty { form.field("language", language) }
+        if let prompt = vocabularyPrompt { form.field("prompt", prompt) }
         form.file("file", filename: "audio.wav", type: "audio/wav", data: try Data(contentsOf: wav))
 
         var req = URLRequest(url: provider.endpoint)

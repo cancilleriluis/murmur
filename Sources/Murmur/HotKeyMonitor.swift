@@ -7,14 +7,18 @@ import CoreGraphics
 /// left/right modifier key). Hold-to-talk semantics.
 final class HotKeyMonitor {
     var onPress: (() -> Void)?
-    var onRelease: (() -> Void)?
+    /// `withModifier` is true when the command-mode modifier (⇧, or ⌃ when
+    /// the hotkey itself is a shift) was held at any point during the hold.
+    var onRelease: ((_ withModifier: Bool) -> Void)?
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var mask: UInt64 = HotKeyMonitor.maskFor("fn")
+    private var modifierMask: UInt64 = 0x20000                 // maskShift
     private var isDown = false
+    private var modifierSeen = false
 
     /// Logs every modifier change to murmur.log. Toggled by `debug_hotkey`.
     var debugLogging = false
@@ -42,6 +46,8 @@ final class HotKeyMonitor {
 
     func setHotkey(_ name: String) {
         mask = HotKeyMonitor.maskFor(name)
+        // Shift can't be the extra modifier for a shift hotkey; use control.
+        modifierMask = name.lowercased().contains("shift") ? 0x40000 : 0x20000
         isDown = false
     }
 
@@ -153,11 +159,18 @@ final class HotKeyMonitor {
                              source, rawFlags, mask, nowDown ? "DOWN" : "up"))
         }
 
+        if (isDown || nowDown) && (rawFlags & modifierMask) != 0 { modifierSeen = true }
+
         // Both sources can report the same physical press; only act on edges.
         if nowDown == isDown { return }
         isDown = nowDown
-        DispatchQueue.main.async { [weak self] in
-            nowDown ? self?.onPress?() : self?.onRelease?()
+        if nowDown {
+            modifierSeen = (rawFlags & modifierMask) != 0
+            DispatchQueue.main.async { [weak self] in self?.onPress?() }
+        } else {
+            let withModifier = modifierSeen
+            modifierSeen = false
+            DispatchQueue.main.async { [weak self] in self?.onRelease?(withModifier) }
         }
     }
 }

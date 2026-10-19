@@ -9,6 +9,8 @@ final class RecordingPill {
 
     enum State {
         case recording
+        /// Hands-free: recording continues after the key is released.
+        case recordingLocked
         case working
         case error(String)
     }
@@ -227,7 +229,13 @@ private final class WaveView: NSView {
         capsule.stroke()
 
         switch state {
-        case .recording:
+        case .recording, .recordingLocked:
+            if case .recordingLocked = state {
+                // A small steady dot on the left: the mic stays on by itself.
+                let dot = NSRect(x: r.minX + 5, y: r.midY - 2.5, width: 5, height: 5)
+                NSColor(calibratedWhite: 1, alpha: 0.9).setFill()
+                NSBezierPath(ovalIn: dot).fill()
+            }
             drawBars(in: r, alpha: 0.95) { i in
                 // Each bar wobbles at its own rate so the row looks like a
                 // voice, not a single meter copied fourteen times.

@@ -83,19 +83,22 @@ final class WhisperServer {
 
     // MARK: - Inference
 
-    func transcribe(wav: URL, language: String, beamSize: Int) throws -> (text: String, detected: String) {
+    func transcribe(wav: URL, language: String, beamSize: Int,
+                    prompt: String? = nil) throws -> (text: String, detected: String) {
         lock.lock(); let port = readyPort; lock.unlock()
         guard let port = port else { throw TranscriptionError.whisperFailed("whisper-server not running") }
-        return try WhisperServer.request(wav: wav, port: port, language: language, beamSize: beamSize)
+        return try WhisperServer.request(wav: wav, port: port, language: language,
+                                         beamSize: beamSize, prompt: prompt)
     }
 
-    private static func request(wav: URL, port: Int, language: String,
-                                beamSize: Int) throws -> (text: String, detected: String) {
+    private static func request(wav: URL, port: Int, language: String, beamSize: Int,
+                                prompt: String? = nil) throws -> (text: String, detected: String) {
         var form = MultipartForm()
         form.field("response_format", "verbose_json")
         form.field("temperature", "0.0")
         form.field("language", language)
         form.field("beam_size", String(max(1, beamSize)))
+        if let prompt = prompt { form.field("prompt", prompt) }
         form.file("file", filename: "audio.wav", type: "audio/wav", data: try Data(contentsOf: wav))
 
         var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/inference")!)
