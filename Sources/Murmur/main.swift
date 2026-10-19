@@ -43,10 +43,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !granted { Log.write("Microphone permission not granted.") }
         }
 
-        if !TextInserter.hasAccessibility(prompt: false) {
-            // Prompt once; the tap below will also fail without it.
-            TextInserter.hasAccessibility(prompt: true)
-        }
+        Log.write("signature: \(Self.signingSummary()) · \(Bundle.main.bundlePath)")
+        healAccessibilityIfNeeded()
 
         if !hotkey.start() {
             showPermissionAlert()
@@ -577,44 +575,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(Paths.logFile)
     }
 
-    /// Clears this app's stale Accessibility entry and asks again. The toggle
-    /// left behind by an older build is tied to that build's signature, so
-    /// flipping it does nothing for this one — it has to be removed.
+    // MARK: Accessibility
+
+    private var accessibilityWatch: Timer?
+
+    /// System Settings keeps showing an older build's grant as "on" while
+    /// this build — signed differently — is denied, and flipping that switch
+    /// changes nothing. So on launch, if we're not trusted, delete our stale
+    /// entry (once per build, so a "not now" isn't undone on every launch),
+    /// ask macOS to prompt, and relaunch by ourselves the moment it's granted.
+    /// The one click left is the one macOS reserves for a person.
+    private func healAccessibilityIfNeeded() {
+        guard !TextInserter.hasAccessibility(prompt: false) else { return }
+        let key = "accessibilityResetForBuild"
+        if UserDefaults.standard.string(forKey: key) != Updater.buildCommit {
+            UserDefaults.standard.set(Updater.buildCommit, forKey: key)
+            resetAccessibilityEntry()
+        }
+        TextInserter.hasAccessibility(prompt: true)
+        watchForAccessibilityGrant()
+    }
+
     @objc private func fixAccessibility() {
+        resetAccessibilityEntry()
+        TextInserter.hasAccessibility(prompt: true)
+        NSWorkspace.shared.open(URL(string:
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        watchForAccessibilityGrant()
+        rebuildMenu()
+    }
+
+    private func resetAccessibilityEntry() {
         let bundleID = Bundle.main.bundleIdentifier ?? "com.murmur.dictation"
         let reset = Process()
         reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
         reset.arguments = ["reset", "Accessibility", bundleID]
+        reset.standardOutput = FileHandle.nullDevice
+        reset.standardError = FileHandle.nullDevice
         do {
             try reset.run()
             reset.waitUntilExit()
-            Log.write("tccutil reset Accessibility \(bundleID) → status \(reset.terminationStatus)")
+            Log.write("cleared stale Accessibility entry for \(bundleID) (tccutil status \(reset.terminationStatus))")
         } catch {
             Log.write("tccutil reset failed: \(error.localizedDescription)")
         }
+    }
 
-        let alert = NSAlert()
-        alert.messageText = "Vuelve a activar Murmur en Accesibilidad"
-        alert.informativeText = """
-        He borrado el permiso antiguo, que pertenecía a una versión anterior \
-        de Murmur.
-
-        1. En Accesibilidad, activa Murmur.
-        2. Sal de Murmur desde el menú y vuelve a abrirlo.
-
-        Para que no vuelva a pasar tras cada actualización, ejecuta una vez \
-        ./setup-signing.sh en la carpeta de Murmur.
-        """
-        alert.addButton(withTitle: "Abrir Accesibilidad")
-        alert.addButton(withTitle: "Cerrar")
-        NSApp.activate(ignoringOtherApps: true)
-        // Registers this build in the list so it shows up with a fresh toggle.
-        TextInserter.hasAccessibility(prompt: true)
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(URL(string:
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    /// Polls until the switch is on, then restarts Murmur so the grant
+    /// applies to everything, with no "quit and reopen" step for you.
+    private func watchForAccessibilityGrant() {
+        accessibilityWatch?.invalidate()
+        let started = Date()
+        accessibilityWatch = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            if TextInserter.hasAccessibility(prompt: false) {
+                timer.invalidate()
+                Log.write("Accessibility granted — relaunching")
+                self.relaunch()
+            } else if Date().timeIntervalSince(started) > 600 {
+                timer.invalidate()   // gave up waiting; the menu item stays
+            }
         }
-        rebuildMenu()
+    }
+
+    private func relaunch() {
+        let path = Bundle.main.bundlePath
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", "sleep 1; open \"$0\"", path]
+        try? proc.run()
+        NSApp.terminate(nil)
+    }
+
+    /// "Murmur Self-Signed" when built after ./setup-signing.sh; "ad-hoc"
+    /// means every rebuild looks like a new app to macOS.
+    static func signingSummary() -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = ["-dvv", Bundle.main.bundlePath]
+        let pipe = Pipe()
+        proc.standardError = pipe          // codesign -d prints to stderr
+        proc.standardOutput = FileHandle.nullDevice
+        guard (try? proc.run()) != nil else { return "unknown" }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        proc.waitUntilExit()
+        if out.contains("Signature=adhoc") { return "ad-hoc (permissions reset on every rebuild)" }
+        if let line = out.split(separator: "\n").first(where: { $0.hasPrefix("Authority=") }) {
+            return String(line)
+        }
+        return "unknown"
     }
 
     // MARK: Updates
