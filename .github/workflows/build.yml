@@ -11,5 +11,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile (release)
-        run: swift build -c release --disable-sandbox
+      - name: Build the app bundle
+        run: ./build.sh
+      - name: Check the bundle
+        run: |
+          test -x build/VoZ.app/Contents/MacOS/VoZ
+          test -f build/VoZ.app/Contents/Resources/AppIcon.icns
+          plutil -lint build/VoZ.app/Contents/Info.plist
+          codesign --verify --verbose build/VoZ.app
