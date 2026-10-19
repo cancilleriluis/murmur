@@ -102,9 +102,13 @@ struct Cleanup {
         for (index, attempt) in attempts.enumerated() {
             let key = Env.get(attempt.provider.keyName)
             if attempt.provider.requiresKey && key == nil { continue }
+            // When something is lined up behind this attempt, give up on a
+            // stalled provider quickly rather than leaving you on the pill.
+            let timeout: TimeInterval = index < attempts.count - 1 ? 10 : 30
             if let out = attemptPolish(provider: attempt.provider, key: key,
                                        model: attempt.model, base: attempt.base,
-                                       system: system, original: trimmed) {
+                                       system: system, original: trimmed,
+                                       timeout: timeout) {
                 if index > 0 {
                     Log.write("cleanup fell back to \(attempt.provider.rawValue)/\(attempt.model)")
                 }
@@ -118,10 +122,10 @@ struct Cleanup {
     /// guard rejects, so the caller can move on to the next provider.
     private func attemptPolish(provider: Provider, key: String?, model: String,
                                base: String, system: String,
-                               original trimmed: String) -> String? {
+                               original trimmed: String, timeout: TimeInterval) -> String? {
         do {
             let out = try call(provider: provider, key: key, model: model,
-                               base: base, system: system, user: trimmed)
+                               base: base, system: system, user: trimmed, timeout: timeout)
             let cleaned = out.trimmingCharacters(in: .whitespacesAndNewlines)
             if cleaned.isEmpty { return nil }
             // Guard against a model that ignored instructions and answered the
@@ -176,10 +180,11 @@ struct Cleanup {
     }
 
     private func call(provider: Provider, key: String?, model: String,
-                      base: String, system: String, user: String) throws -> String {
+                      base: String, system: String, user: String,
+                      timeout: TimeInterval) throws -> String {
         var req = URLRequest(url: provider.endpoint(base: base))
         req.httpMethod = "POST"
-        req.timeoutInterval = 30
+        req.timeoutInterval = timeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let payload: [String: Any]

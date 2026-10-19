@@ -1,0 +1,15 @@
+# Compiles Murmur on a real Mac so a broken build is caught on push,
+# not when you next run ./build.sh --install.
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile (release)
+        run: swift build -c release --disable-sandbox
