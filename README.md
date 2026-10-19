@@ -58,6 +58,25 @@ Settings live in `~/.config/murmur/config.json` and are also not in the repo, so
 each machine can have its own hotkey and provider. Copy that file too if you
 want identical behaviour on both.
 
+## Updating
+
+Once installed, Murmur updates itself from its menu: it checks GitHub's `main`
+at launch and every 6 hours, and when there is something new the menu shows
+**⬆︎ Actualizar Murmur (N cambios)…**. Clicking it pulls `main` into the
+checkout the app was built from and runs `./build.sh --install` (1–2 minutes);
+Murmur quits and reopens on the new version. **Buscar actualizaciones…** checks
+on demand. Output goes to `~/.config/murmur/update.log`.
+
+It rebuilds on your Mac rather than downloading a binary, so the app keeps your
+own signing identity. Run `./setup-signing.sh` once, or every update will need
+Accessibility granted again.
+
+A build made before this feature existed has no updater; update it once by hand:
+
+```bash
+cd ~/Murmur && git checkout main && git pull && ./build.sh --install
+```
+
 ## Install (same machine)
 
 ```bash

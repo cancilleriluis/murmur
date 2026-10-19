@@ -10,6 +10,9 @@ cd "$(dirname "$0")"
 APP_NAME="Murmur"
 BUNDLE_ID="com.murmur.dictation"
 VERSION="1.0.0"
+# Recorded in Info.plist so the app can update itself from this checkout.
+SOURCE_DIR="$(pwd)"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUILD_DIR="build"
 APP_DIR="$BUILD_DIR/$APP_NAME.app"
 
@@ -40,6 +43,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>           <string>APPL</string>
     <key>CFBundleShortVersionString</key>    <string>$VERSION</string>
     <key>CFBundleVersion</key>               <string>$VERSION</string>
+    <key>MurmurSourceDir</key>               <string>$SOURCE_DIR</string>
+    <key>MurmurCommit</key>                  <string>$COMMIT</string>
     <key>LSMinimumSystemVersion</key>        <string>13.0</string>
 
     <!-- Menu-bar only: no Dock icon, no main window. -->

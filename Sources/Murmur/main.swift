@@ -19,6 +19,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingJobs = 0
     /// Kept so it can be re-copied from the menu if the paste went nowhere.
     private var lastTranscript: String = ""
+    /// Newer commits on GitHub's main than this build, from the last check.
+    private var pendingUpdate: Updater.Status?
+    private var updateTimer: Timer?
 
     private let work = DispatchQueue(label: "murmur.pipeline", qos: .userInitiated)
 
@@ -49,7 +52,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showPermissionAlert()
         }
 
-        Log.write("Murmur started. hotkey=\(store.config.hotkey) backend=\(store.config.transcription_backend)")
+        // Look for a newer version now and every few hours; the menu shows
+        // an "Actualizar" item when there is one.
+        checkForUpdates(interactive: false)
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            self?.checkForUpdates(interactive: false)
+        }
+
+        Log.write("Murmur started (build \(Updater.buildCommit)). hotkey=\(store.config.hotkey) backend=\(store.config.transcription_backend)")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -261,6 +271,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // After a rebuild with a new signature, System Settings keeps showing
         // the old grant as enabled while this build is denied. Offer the fix
         // right at the top instead of failing silently on every paste.
+        if let update = pendingUpdate, update.behind > 0 {
+            let item = NSMenuItem(title: "⬆︎ Actualizar Murmur (\(update.behind) cambio\(update.behind == 1 ? "" : "s"))…",
+                                  action: #selector(installUpdate), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+            menu.addItem(.separator())
+        }
+
         if !TextInserter.hasAccessibility(prompt: false) {
             let fix = NSMenuItem(title: "⚠︎ Arreglar permiso de Accesibilidad…",
                                  action: #selector(fixAccessibility), keyEquivalent: "")
@@ -409,6 +427,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(historyParent)
 
         menu.addItem(.separator())
+
+        let updates = NSMenuItem(title: "Buscar actualizaciones…",
+                                 action: #selector(checkForUpdatesFromMenu), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
 
         let openConfig = NSMenuItem(title: "Edit Settings…",
                                     action: #selector(openConfig), keyEquivalent: ",")
@@ -592,6 +615,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
         }
         rebuildMenu()
+    }
+
+    // MARK: Updates
+
+    @objc private func checkForUpdatesFromMenu() {
+        checkForUpdates(interactive: true)
+    }
+
+    private func checkForUpdates(interactive: Bool) {
+        DispatchQueue.global(qos: .utility).async {
+            let status = Updater.check()
+            DispatchQueue.main.async {
+                self.pendingUpdate = status
+                self.rebuildMenu()
+                guard interactive else { return }
+                if Updater.sourceDir == nil {
+                    self.showInfo("No sé dónde está el código de Murmur",
+                                  "Esta versión se compiló antes de que existieran las actualizaciones desde el menú. Actualiza una última vez a mano:\n\ncd ~/Murmur && git checkout main && git pull && ./build.sh --install")
+                } else if let status = status, status.behind > 0 {
+                    self.installUpdate()
+                } else if status == nil {
+                    self.showInfo("No se pudo comprobar", "No he podido contactar con GitHub. Revisa la conexión e inténtalo de nuevo.")
+                } else {
+                    self.showInfo("Murmur está al día", "Tienes la última versión (\(Updater.buildCommit)).")
+                }
+            }
+        }
+    }
+
+    @objc private func installUpdate() {
+        let changes = (pendingUpdate?.summary ?? []).prefix(8).map { "• \($0)" }.joined(separator: "\n")
+        let alert = NSAlert()
+        alert.messageText = "Actualizar Murmur"
+        alert.informativeText = """
+        \(changes.isEmpty ? "Hay una versión nueva en GitHub." : changes)
+
+        Se descarga y se compila en este Mac (1–2 minutos). Murmur se \
+        cerrará y volverá a abrirse solo.
+        """
+        alert.addButton(withTitle: "Actualizar")
+        alert.addButton(withTitle: "Ahora no")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        pill.show(state: .working)
+        Updater.install { [weak self] in
+            self?.pill.hide()
+            let fail = NSAlert()
+            fail.messageText = "La actualización falló"
+            fail.informativeText = "Murmur sigue funcionando con la versión actual. Los detalles están en update.log."
+            fail.addButton(withTitle: "Ver detalles")
+            fail.addButton(withTitle: "Cerrar")
+            NSApp.activate(ignoringOtherApps: true)
+            if fail.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(Updater.logFile)
+            }
+        }
+    }
+
+    private func showInfo(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func checkPermissions() {
