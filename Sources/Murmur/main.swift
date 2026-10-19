@@ -185,21 +185,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.lastTranscript = polished
                 let ax = TextInserter.hasAccessibility(prompt: false)
-                Log.write("inserting via \(config.insertion) — accessibility=\(ax ? "granted" : "NOT GRANTED (paste will silently fail)")")
+                var mode = config.insertion.lowercased()
+                var notice: String?
+                if !ax && mode != "clipboard" {
+                    // macOS drops synthetic ⌘V / keystrokes from an untrusted
+                    // app without any error, so the dictation would vanish.
+                    // Leave it on the clipboard instead and say so.
+                    mode = "clipboard"
+                    notice = "Sin Accesibilidad · pega con ⌘V"
+                    Log.write("accessibility NOT GRANTED — copied to clipboard instead of pasting. Use menu ▸ Arreglar permiso de Accesibilidad.")
+                } else {
+                    Log.write("inserting via \(mode) — accessibility=\(ax ? "granted" : "not needed")")
+                }
                 // Keeping the text on the clipboard and restoring the old
                 // contents are mutually exclusive; keeping wins.
                 TextInserter.insert(polished,
-                                    using: config.insertion,
+                                    using: mode,
                                     restoreClipboard: config.restore_clipboard
                                                       && !config.keep_in_clipboard)
-                if config.keep_in_clipboard && config.insertion.lowercased() == "type" {
+                if config.keep_in_clipboard && mode == "type" {
                     // "type" never touches the pasteboard, so put it there now.
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(polished, forType: .string)
                 }
                 self.rebuildMenu()
+                self.finishJob(error: notice)
             }
-            finishJob()
         } catch {
             Log.write("Pipeline failed: \(error.localizedDescription)")
             finishJob(error: Self.shortError(error))
@@ -246,6 +257,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         let menu = NSMenu()
         let cfg = store.config
+
+        // After a rebuild with a new signature, System Settings keeps showing
+        // the old grant as enabled while this build is denied. Offer the fix
+        // right at the top instead of failing silently on every paste.
+        if !TextInserter.hasAccessibility(prompt: false) {
+            let fix = NSMenuItem(title: "⚠︎ Arreglar permiso de Accesibilidad…",
+                                 action: #selector(fixAccessibility), keyEquivalent: "")
+            fix.target = self
+            menu.addItem(fix)
+            menu.addItem(.separator())
+        }
 
         let toggle = NSMenuItem(title: isEnabled ? "Dictation On" : "Dictation Off",
                                 action: #selector(toggleEnabled), keyEquivalent: "")
@@ -530,6 +552,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? "".write(to: Paths.logFile, atomically: true, encoding: .utf8)
         }
         NSWorkspace.shared.open(Paths.logFile)
+    }
+
+    /// Clears this app's stale Accessibility entry and asks again. The toggle
+    /// left behind by an older build is tied to that build's signature, so
+    /// flipping it does nothing for this one — it has to be removed.
+    @objc private func fixAccessibility() {
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.murmur.dictation"
+        let reset = Process()
+        reset.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        reset.arguments = ["reset", "Accessibility", bundleID]
+        do {
+            try reset.run()
+            reset.waitUntilExit()
+            Log.write("tccutil reset Accessibility \(bundleID) → status \(reset.terminationStatus)")
+        } catch {
+            Log.write("tccutil reset failed: \(error.localizedDescription)")
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Vuelve a activar Murmur en Accesibilidad"
+        alert.informativeText = """
+        He borrado el permiso antiguo, que pertenecía a una versión anterior \
+        de Murmur.
+
+        1. En Accesibilidad, activa Murmur.
+        2. Sal de Murmur desde el menú y vuelve a abrirlo.
+
+        Para que no vuelva a pasar tras cada actualización, ejecuta una vez \
+        ./setup-signing.sh en la carpeta de Murmur.
+        """
+        alert.addButton(withTitle: "Abrir Accesibilidad")
+        alert.addButton(withTitle: "Cerrar")
+        NSApp.activate(ignoringOtherApps: true)
+        // Registers this build in the list so it shows up with a fresh toggle.
+        TextInserter.hasAccessibility(prompt: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        }
+        rebuildMenu()
     }
 
     @objc private func checkPermissions() {
