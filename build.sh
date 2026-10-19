@@ -1,14 +1,21 @@
 #!/bin/bash
-# Builds Murmur.app — a self-contained menu-bar app bundle.
+# Builds VoZ.app — a self-contained menu-bar app bundle.
 #
-#   ./build.sh            build into ./build/Murmur.app
+#   ./build.sh            build into ./build/VoZ.app
 #   ./build.sh --install  also copy to /Applications and relaunch
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-APP_NAME="Murmur"
+APP_NAME="VoZ"
+# The Swift target keeps its original name.
+PRODUCT="Murmur"
+# Unchanged since the app was called Murmur: macOS keys the Microphone,
+# Accessibility and Input Monitoring grants to it, so keeping it means the
+# rename doesn't cost you your permissions.
 BUNDLE_ID="com.murmur.dictation"
+# Earlier name, removed on install so you don't end up with two apps.
+LEGACY_NAME="Murmur"
 VERSION="1.0.0"
 # Recorded in Info.plist so the app can update itself from this checkout.
 SOURCE_DIR="$(pwd)"
@@ -19,7 +26,7 @@ APP_DIR="$BUILD_DIR/$APP_NAME.app"
 echo "==> Compiling (release)…"
 swift build -c release --disable-sandbox
 
-BIN_PATH="$(swift build -c release --show-bin-path)/$APP_NAME"
+BIN_PATH="$(swift build -c release --show-bin-path)/$PRODUCT"
 if [[ ! -f "$BIN_PATH" ]]; then
   echo "!! Build produced no binary at $BIN_PATH" >&2
   exit 1
@@ -30,6 +37,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
+cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,6 +49,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>                  <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>           <string>$APP_NAME</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
+    <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>    <string>$VERSION</string>
     <key>CFBundleVersion</key>               <string>$VERSION</string>
     <key>MurmurSourceDir</key>               <string>$SOURCE_DIR</string>
@@ -51,7 +60,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>LSUIElement</key>                   <true/>
 
     <key>NSMicrophoneUsageDescription</key>
-    <string>Murmur records your voice while you hold the push-to-talk key so it can transcribe it into text.</string>
+    <string>VoZ records your voice while you hold the push-to-talk key so it can transcribe it into text.</string>
 
     <key>NSHumanReadableCopyright</key>      <string>Local dictation. No accounts, no telemetry.</string>
 </dict>
@@ -96,8 +105,9 @@ echo "==> Built $APP_DIR"
 if [[ "${1:-}" == "--install" ]]; then
   echo "==> Installing to /Applications…"
   pkill -x "$APP_NAME" 2>/dev/null || true
+  pkill -x "$LEGACY_NAME" 2>/dev/null || true
   sleep 1
-  rm -rf "/Applications/$APP_NAME.app"
+  rm -rf "/Applications/$APP_NAME.app" "/Applications/$LEGACY_NAME.app"
   cp -R "$APP_DIR" "/Applications/$APP_NAME.app"
   echo "==> Launching…"
   open "/Applications/$APP_NAME.app"
@@ -106,5 +116,5 @@ if [[ "${1:-}" == "--install" ]]; then
   echo "  System Settings ▸ Privacy & Security ▸ Microphone"
   echo "  System Settings ▸ Privacy & Security ▸ Accessibility"
   echo "  System Settings ▸ Privacy & Security ▸ Input Monitoring"
-  echo "Then quit and reopen Murmur."
+  echo "Then quit and reopen $APP_NAME."
 fi

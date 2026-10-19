@@ -155,7 +155,7 @@ enum WaveShape {
             return true
         }
         image.isTemplate = true
-        image.accessibilityDescription = "Murmur"
+        image.accessibilityDescription = "VoZ"
         return image
     }
 }

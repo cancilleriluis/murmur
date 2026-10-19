@@ -1,4 +1,10 @@
-# Murmur
+# VoZ
+
+<img src="Resources/AppIcon.png" width="96" alt="VoZ icon">
+
+*Formerly Murmur.* The app is now called VoZ; the repository, the
+`~/.config/murmur` settings folder and the bundle ID (`com.murmur.dictation`,
+which your macOS permissions are tied to) keep the old name.
 
 System-wide push-to-talk dictation for macOS. Hold a key, talk, release — your
 words land at the cursor in whatever app is focused, cleaned up and punctuated.
@@ -62,7 +68,7 @@ want identical behaviour on both.
 
 Once installed, Murmur updates itself from its menu: it checks GitHub's `main`
 at launch and every 6 hours, and when there is something new the menu shows
-**⬆︎ Actualizar Murmur (N cambios)…**. Clicking it pulls `main` into the
+**⬆︎ Actualizar VoZ (N cambios)…**. Clicking it pulls `main` into the
 checkout the app was built from and runs `./build.sh --install` (1–2 minutes);
 Murmur quits and reopens on the new version. **Buscar actualizaciones…** checks
 on demand. Output goes to `~/.config/murmur/update.log`.

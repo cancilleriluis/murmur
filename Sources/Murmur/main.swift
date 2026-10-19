@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.checkForUpdates(interactive: false)
         }
 
-        Log.write("Murmur started (build \(Updater.buildCommit)). hotkey=\(store.config.hotkey) backend=\(store.config.transcription_backend)")
+        Log.write("VoZ started (build \(Updater.buildCommit)). hotkey=\(store.config.hotkey) backend=\(store.config.transcription_backend)")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -270,7 +270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the old grant as enabled while this build is denied. Offer the fix
         // right at the top instead of failing silently on every paste.
         if let update = pendingUpdate, update.behind > 0 {
-            let item = NSMenuItem(title: "⬆︎ Actualizar Murmur (\(update.behind) cambio\(update.behind == 1 ? "" : "s"))…",
+            let item = NSMenuItem(title: "⬆︎ Actualizar VoZ (\(update.behind) cambio\(update.behind == 1 ? "" : "s"))…",
                                   action: #selector(installUpdate), keyEquivalent: "")
             item.target = self
             menu.addItem(item)
@@ -452,7 +452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Quit Murmur", action: #selector(quit), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit VoZ", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
 
@@ -680,14 +680,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.rebuildMenu()
                 guard interactive else { return }
                 if Updater.sourceDir == nil {
-                    self.showInfo("No sé dónde está el código de Murmur",
+                    self.showInfo("No sé dónde está el código de VoZ",
                                   "Esta versión se compiló antes de que existieran las actualizaciones desde el menú. Actualiza una última vez a mano:\n\ncd ~/Murmur && git checkout main && git pull && ./build.sh --install")
                 } else if let status = status, status.behind > 0 {
                     self.installUpdate()
                 } else if status == nil {
                     self.showInfo("No se pudo comprobar", "No he podido contactar con GitHub. Revisa la conexión e inténtalo de nuevo.")
                 } else {
-                    self.showInfo("Murmur está al día", "Tienes la última versión (\(Updater.buildCommit)).")
+                    self.showInfo("VoZ está al día", "Tienes la última versión (\(Updater.buildCommit)).")
                 }
             }
         }
@@ -696,11 +696,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func installUpdate() {
         let changes = (pendingUpdate?.summary ?? []).prefix(8).map { "• \($0)" }.joined(separator: "\n")
         let alert = NSAlert()
-        alert.messageText = "Actualizar Murmur"
+        alert.messageText = "Actualizar VoZ"
         alert.informativeText = """
         \(changes.isEmpty ? "Hay una versión nueva en GitHub." : changes)
 
-        Se descarga y se compila en este Mac (1–2 minutos). Murmur se \
+        Se descarga y se compila en este Mac (1–2 minutos). VoZ se \
         cerrará y volverá a abrirse solo.
         """
         alert.addButton(withTitle: "Actualizar")
@@ -713,7 +713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pill.hide()
             let fail = NSAlert()
             fail.messageText = "La actualización falló"
-            fail.informativeText = "Murmur sigue funcionando con la versión actual. Los detalles están en update.log."
+            fail.informativeText = "VoZ sigue funcionando con la versión actual. Los detalles están en update.log."
             fail.addButton(withTitle: "Ver detalles")
             fail.addButton(withTitle: "Cerrar")
             NSApp.activate(ignoringOtherApps: true)
@@ -739,7 +739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let receiving = hotkey.hasSeenAnyEvent
 
         let alert = NSAlert()
-        alert.messageText = "Murmur Permissions"
+        alert.messageText = "VoZ Permissions"
         alert.informativeText = """
         Microphone:     \(mic ? "granted" : "NOT granted")
         Accessibility:  \(ax ? "granted" : "NOT granted")
@@ -748,7 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         If that says NONE YET: press a modifier key (⌘, ⌥, fn) a few \
         times, then open this dialog again. If it still says NONE, grant \
-        Input Monitoring AND Accessibility, then quit and reopen Murmur.
+        Input Monitoring AND Accessibility, then quit and reopen VoZ.
         """
         alert.addButton(withTitle: "Open Privacy Settings")
         alert.addButton(withTitle: "Close")
@@ -761,12 +761,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showPermissionAlert() {
         let alert = NSAlert()
-        alert.messageText = "Murmur needs Input Monitoring"
+        alert.messageText = "VoZ needs Input Monitoring"
         alert.informativeText = """
-        Murmur can't watch the push-to-talk key yet.
+        VoZ can't watch the push-to-talk key yet.
 
         Open System Settings ▸ Privacy & Security ▸ Input Monitoring \
-        (and Accessibility) and enable Murmur, then relaunch the app.
+        (and Accessibility) and enable VoZ, then relaunch the app.
         """
         alert.addButton(withTitle: "Open Settings")
         alert.addButton(withTitle: "Later")
@@ -818,7 +818,7 @@ enum LaunchAtLogin {
 if CommandLine.arguments.contains("--test-pipeline") {
     let args = CommandLine.arguments
     guard let idx = args.firstIndex(of: "--test-pipeline"), idx + 1 < args.count else {
-        print("usage: Murmur --test-pipeline <file.wav>")
+        print("usage: VoZ --test-pipeline <file.wav>")
         exit(2)
     }
     let wav = URL(fileURLWithPath: (args[idx + 1] as NSString).expandingTildeInPath)
