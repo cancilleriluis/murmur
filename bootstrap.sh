@@ -22,29 +22,110 @@ if ! xcode-select -p >/dev/null 2>&1; then
 fi
 ok "Xcode Command Line Tools"
 
-if ! command -v brew >/dev/null 2>&1; then
-  warn "Homebrew not found. Install from https://brew.sh, then rerun."
+# `command -v brew` only answers "is brew on this shell's PATH", which is a
+# different question from "is Homebrew installed". On Apple Silicon it installs
+# to /opt/homebrew and does nothing to your PATH until you add its shellenv line
+# — so a perfectly good install reports "command not found" and this script used
+# to give up on it.
+BREW=""
+if command -v brew >/dev/null 2>&1; then
+  BREW="$(command -v brew)"
+else
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -x "$candidate" ]] && { BREW="$candidate"; break; }
+  done
+  if [[ -n "$BREW" ]]; then
+    warn "Homebrew is installed at $BREW but is not on your PATH."
+    warn "Using it anyway. To fix your shell permanently, run:"
+    warn "  echo 'eval \"\$($BREW shellenv)\"' >> ~/.zprofile && eval \"\$($BREW shellenv)\""
+  fi
+fi
+
+if [[ -z "$BREW" ]]; then
+  warn "Homebrew not found. Install it with:"
+  warn '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+  warn "Then follow the 'Next steps' it prints (they add brew to your PATH) and rerun this script."
   exit 1
 fi
-ok "Homebrew"
+ok "Homebrew ($BREW)"
 
 step "Installing whisper.cpp"
-if command -v whisper-cli >/dev/null 2>&1; then
-  ok "already installed"
+# Look in the Homebrew prefixes as well as $PATH: Murmur resolves the binary by
+# absolute path, so "on $PATH" and "installed" are not the same question, and
+# answering the wrong one here means the app falls back to a hosted API.
+find_whisper() {
+  local d n
+  for d in "$("$BREW" --prefix 2>/dev/null)/bin" /opt/homebrew/bin /usr/local/bin; do
+    for n in whisper-cli whisper-cpp whisper; do
+      [[ -x "$d/$n" ]] && { echo "$d/$n"; return 0; }
+    done
+  done
+  command -v whisper-cli 2>/dev/null && return 0
+  return 1
+}
+
+WHISPER_BIN="$(find_whisper || true)"
+if [[ -n "$WHISPER_BIN" ]]; then
+  ok "already installed ($WHISPER_BIN)"
 else
-  brew install whisper-cpp || { warn "brew install failed"; exit 1; }
-  ok "installed"
+  "$BREW" install whisper-cpp || { warn "brew install failed"; exit 1; }
+  WHISPER_BIN="$(find_whisper || true)"
+  [[ -n "$WHISPER_BIN" ]] || { warn "brew reported success but no whisper binary was found"; exit 1; }
+  ok "installed ($WHISPER_BIN)"
 fi
 
 step "Downloading the speech model (~465 MB, once)"
 mkdir -p "$MODEL_DIR"
-if [[ -f "$MODEL" ]] && [[ $(stat -f%z "$MODEL" 2>/dev/null || echo 0) -gt 400000000 ]]; then
+
+# A real whisper model starts with magic 0x67676d6c written as a native-endian
+# uint32, so the bytes on disk are "lmgg" — NOT "ggml". Checking that, rather
+# than only the size, is what tells a model apart from an error page saved under
+# a .bin name: `curl` without -f writes the server's error body to the output
+# file and still exits 0, so every later run reports "model already present".
+model_magic_ok() {
+  local m
+  m=$(head -c 4 "$1" 2>/dev/null)
+  [[ "$m" == "lmgg" || "$m" == "GGUF" ]]
+}
+
+model_is_big_enough() {
+  [[ $(stat -f%z "$1" 2>/dev/null || echo 0) -gt 400000000 ]]
+}
+
+model_is_valid() {
+  [[ -f "$1" ]] && model_is_big_enough "$1" && model_magic_ok "$1"
+}
+
+if model_is_valid "$MODEL"; then
   ok "model already present"
 else
-  curl -L --progress-bar -o "$MODEL" \
+  if [[ -f "$MODEL" ]]; then
+    # Only ever delete a file that is obviously a failed download. A large file
+    # whose magic looks wrong gets a warning and a stop: half a gigabyte the
+    # user waited for is not something to throw away on a heuristic.
+    if model_is_big_enough "$MODEL"; then
+      warn "$MODEL is $(stat -f%z "$MODEL") bytes but its header doesn't look like a model."
+      warn "NOT deleting it — check it by hand:  head -c 4 \"$MODEL\"   (expected: lmgg)"
+      warn "If it really is broken, delete it yourself and rerun this script."
+      exit 1
+    fi
+    warn "existing $MODEL is only $(stat -f%z "$MODEL" 2>/dev/null || echo 0) bytes — a failed download. Removing it."
+    rm -f "$MODEL"
+  fi
+  # -f so an HTTP error is an error instead of a file full of HTML.
+  # -C - resumes a partial download instead of restarting the 465 MB.
+  curl -fL --progress-bar --retry 3 --retry-delay 2 -C - -o "$MODEL" \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin \
-    || { warn "download failed — rerun to resume"; exit 1; }
-  ok "downloaded"
+    || { warn "download failed — rerun to resume where it stopped"; exit 1; }
+
+  if ! model_is_valid "$MODEL"; then
+    warn "the downloaded file is not a valid model. Leaving it in place for inspection:"
+    warn "  ls -la \"$MODEL\"  &&  head -c 4 \"$MODEL\"    (expected: lmgg)"
+    warn "Download it by hand if this keeps happening:"
+    warn "  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+    exit 1
+  fi
+  ok "downloaded and verified"
 fi
 
 step "Setting up a stable signing identity"
@@ -79,7 +160,12 @@ cat <<'EOF'
      Never commit that file.
 
   Hold the push-to-talk key (Left Option by default), speak, release.
-  Verify anything without the mic or hotkey:
+
+  If anything misbehaves, this prints exactly which step is broken —
+  config, local model, keys, live network, permissions:
+     /Applications/VoZ.app/Contents/MacOS/VoZ --doctor
+
+  Or run the transcribe -> cleanup path against a file, no mic or hotkey needed:
      /Applications/Murmur.app/Contents/MacOS/Murmur --test-pipeline some.wav
 
 EOF

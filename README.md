@@ -152,8 +152,18 @@ curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.
 curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin
 ```
 
-Murmur auto-detects both `whisper-cli` and the model — no config needed. If
-several models are present it picks the largest.
+Murmur auto-detects both `whisper-cli` and the model — no config needed. Any
+`ggml-*.bin` in that directory counts, including `large-v3`, quantized `-q5_1`
+builds and `distil-` builds; if several are present it picks the largest, and
+ignores anything under 1 MB so a half-finished download never wins. Set
+`whisper_model_path` to a file to pin one, or to a directory to search there
+instead.
+
+`whisper-cli` is looked for in the Homebrew prefixes (Apple Silicon and Intel),
+MacPorts, `~/.local/bin`, and `$PATH`, under each of the names the formula has
+used (`whisper-cli`, `whisper-cpp`, `whisper`). Run `--doctor` to see which one
+it resolved — a miss here is otherwise invisible, and pushes every dictation
+onto a hosted API.
 
 > English-only variants (`ggml-small.en.bin`) are a bit sharper if you only ever
 > dictate in English.
@@ -224,8 +234,13 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
   "whisper_model_path": "",          // empty = autodetect from models/
   "whisper_server": true,            // keep the model loaded (see Speed below)
   "whisper_server_port": 8178,
+  "whisper_threads": 0,              // 0 = performance cores only
   "whisper_beam_size": 1,            // 1 = greedy/fast; 5 = whisper.cpp default
+  "whisper_flash_attn": "auto",      // auto | on | off
+  "warm_up": true,                   // compile Metal shaders at launch
+  "api_timeout_seconds": 25,         // before falling back to the next backend
   "language": "auto",                // "auto" detects; "es"/"en"/… pins it
+                                     // pinning it also skips the retry decode
   "languages": ["es","en","it","pt"],// languages you actually speak
 
   "history": {
@@ -241,7 +256,8 @@ Use **Check Permissions…** in the menu bar to see the live status of all three
     "prompt": "",                    // empty = built-in dictation prompt
     "base_url": "",                  // empty = provider default; primary only
     "fallback_provider": "openai",   // retried when the primary fails
-    "fallback_model": "gpt-4o"       // must not be a mini-tier model
+    "fallback_model": "gpt-4o",      // must not be a mini-tier model
+    "timeout_seconds": 12            // before giving up on the primary
   },
 
   "insertion": "paste",              // paste (⌘V at the caret)
@@ -330,6 +346,27 @@ gpt-4o serves you at ~2.5 s when it's on, with no configuration change.
 `base_url` applies to the **primary provider only** — the fallback always uses
 its own host, since pointing it at the primary's unreachable host would just
 fail the same way.
+
+**Transcription has its own chain**, and unlike cleanup a failure there is
+fatal — no fallback means no text at all. The order depends on what you asked
+for:
+
+| `transcription_backend` | Order tried |
+|---|---|
+| `"auto"` (default) | local, if a model is installed — **and nothing else**. With no local model: Groq → OpenAI |
+| `"local"` | local only |
+| `"groq"` | Groq → local → OpenAI |
+| `"openai"` | OpenAI → local → Groq |
+
+A working local model is deliberately a chain of one. The privacy promise at the
+top of this README is that a local setup makes no network calls, so Murmur will
+not start uploading your audio because whisper.cpp had a bad day — it reports the
+local failure instead. The chaining only kicks in for a hosted backend you
+actually chose, and there local is the *first* fallback, because it is the one
+thing a VPN, an expired key, or a provider outage cannot refuse.
+
+The menu-bar status line shows the live plan (`groq → local whisper.cpp`), so a
+silent fallback is visible before it costs you a dictation.
 
 ### Fully offline cleanup with Ollama
 
@@ -449,6 +486,7 @@ to `right_option`.
 - **Launch at Login** — registers via `SMAppService`
 - **Edit Settings… / Reload Settings / Show Log**
 - **Check Permissions…** — live status of all three grants
+- **Run Diagnostics…** — the full `--doctor` report, opened in TextEdit
 
 The icon becomes a filled capsule while recording, so you always know if it's hot.
 The status line under the toggle shows `· model loaded` once the local
@@ -457,6 +495,61 @@ whisper-server is warm.
 ---
 
 ## Troubleshooting
+
+**Start here: `--doctor`.**
+
+```bash
+/Applications/VoZ.app/Contents/MacOS/VoZ --doctor
+```
+
+Or **Run Diagnostics…** from the menu-bar icon, which writes the same report to
+`~/.config/murmur/diagnostics.txt` and opens it. It walks the whole pipeline in
+order and prints what it actually found at each step: whether `config.json`
+parsed, which `whisper-cli` and which model were resolved (and what else is
+sitting in the models directory), which keys are present — masked, with their
+length, which is what catches a truncated paste — the transcription plan in
+order, a **live request to every provider that has a key**, and the state of
+each permission. It exits non-zero when it finds something blocking.
+
+The network check is two requests per provider on purpose. Listing models proves
+the host is reachable and the key is valid; a real one-token completion is what a
+blocked IP actually gets refused on. Groq is why: its `/v1/models` answers from
+any address while `/chat/completions` returns 403, so a check that only did the
+first would call a completely unusable setup healthy.
+
+**"API unreachable" / "API error" in the pill.**
+The pill has room for about four words; the sentence that names the fix is in
+`~/.config/murmur/murmur.log`. The two are different problems:
+
+| Pill | Means | Look at |
+|---|---|---|
+| `API unreachable` | The request never got an HTTP response, or the provider refused the *network* | VPN, proxy, DNS, corporate TLS interception, provider outage |
+| `API error` | The provider answered and said no | The key, the quota, the model name |
+
+The log line spells out which: `cannot resolve api.groq.com — DNS is failing`,
+`TLS to api.openai.com failed — something is intercepting HTTPS`, `Groq refused
+this IP address (403)`, `rejected the API key (401)`, and so on.
+
+If it says `API unreachable` and `--doctor` shows local whisper.cpp as
+`unavailable`, that is the actual bug — every dictation is going over the
+network because there is no local model to use. `./bootstrap.sh` fixes it, and
+after that a blocked API cannot stop dictation at all.
+
+**A key that looks right but gets rejected (401).**
+`.env` values are parsed strictly enough to break on things you cannot see. All
+of these now work, and all of them used to fail silently:
+
+```bash
+export GROQ_API_KEY=gsk_...      # the `export` prefix is stripped
+OPENAI_API_KEY="sk-..."          # quotes are stripped
+ANTHROPIC_API_KEY=sk-... # work  # trailing comments are stripped
+```
+
+Also stripped: a UTF-8 BOM (TextEdit adds one, and it renames the *first* key in
+the file so it is never found), and any whitespace, non-breaking space, or
+zero-width character inside a value — the usual souvenir of copying a key out of
+a web dashboard. `--doctor` prints each key's length; compare it against the
+provider's dashboard if you suspect a truncated paste.
 
 **Nothing happens when I hold the key.**
 First check whether *another app already owns that key*. Wispr Flow, Raycast and
@@ -488,11 +581,22 @@ If real speech is being dropped, lower `min_peak_level` (try `0.15`). If silence
 still produces text, raise it (try `0.30`). The log tells you which gate fired
 and the measured peak, so tune against real numbers rather than guessing.
 
-**Groq returns "Access denied. Please check your network settings."**
-Groq blocks VPN and datacenter IPs on `/chat/completions` — the `/v1/models`
-endpoint still answers, which makes it look like a key problem when it isn't.
-No header or retry gets past it. This is handled automatically: see the fallback
-chain below.
+**Groq returns "Access denied. Please check your network settings." (403)**
+Groq blocks VPN, datacenter and some regional IPs. No header, no retry and no
+new key gets past it — the key was never the problem. It usually shows up on
+`/chat/completions` while `/v1/models` still answers, which is what makes it
+read like a key problem, but a hard block returns 403 on both.
+
+**A 403 is not a 401.** 401 means the key is wrong; 403 means the provider knows
+who you are and still won't serve this network. `--doctor` reads the response
+body to tell them apart and says which one you have, because regenerating a
+perfectly good key is the standard way to lose an hour here.
+
+Handled automatically at both stages: cleanup retries with `fallback_provider`,
+and transcription moves to the next backend in its plan. But if the only
+transcription backend you have is a blocked provider, there is nothing to fall
+back *to* — install the local model and the network stops being able to break
+dictation at all.
 
 **Mid-sentence language switching, and why the fallback model is `gpt-4o`.**
 If you switch languages mid-dictation ("…esto es lo que hago. Because I have to
@@ -526,9 +630,57 @@ transcribing.
 **Some apps ignore the paste.** Switch `"insertion"` to `"type"`. Slower, but it
 synthesizes real keystrokes and leaves the pasteboard alone entirely.
 
-**The first transcription takes ~10 seconds, then it's fast.** That's
-whisper.cpp compiling its Metal GPU shaders once and caching them. Measured on
-an M4 with `small`: first run 13 s, every run after 0.85–1.1 s for 8 s of audio
+**It's slow.**
+Read the `timing:` line the log writes after every dictation:
+
+```
+timing: 3.80s audio -> transcribe 1.05s + cleanup 0.42s = 1.47s total (0.4x realtime)
+```
+
+That splits the wait into the two halves that look identical from the outside.
+Then, in order of how much time they usually account for:
+
+- **The first run after a reboot or rebuild** is whisper.cpp compiling its Metal
+  shaders and caching them. Murmur now does this at launch on a silent clip
+  (`warm_up`), so it lands where nobody is waiting instead of on your first
+  dictation. The log says `warm-up: whisper ready in …`.
+- **`transcribe` is high on every take.** Check `--doctor`: it prints the thread
+  count, the beam size, and a measured `speed` figure for a real clip. The model
+  matters most — `small` is about 1 s for 8 s of audio on an M4, plain
+  `large-v3` is five to seven. Auto-selection already prefers the fast ones;
+  `whisper_model_path` overrides it.
+- **A doubled transcribe time** means the language allowlist fired: with
+  `"language": "auto"`, a detection outside `languages` is re-run from scratch
+  in your main language, so the take costs twice what it should. It is common
+  for speech that sits near a neighbouring language — Spanish heard as Galician
+  or Catalan. The log names it and tells you which of the two fixes you want.
+  Pinning `"language": "es"` skips detection entirely and is the single biggest
+  latency lever in the app.
+- **`cleanup` is high.** A hosted LLM adds 0.4–2.5 s. If it is much more than
+  that, the primary provider is timing out before the fallback gets its turn —
+  `cleanup.timeout_seconds` (12 s) caps that, and `--doctor` shows which
+  providers actually answer. Turning **AI Cleanup** off in the menu removes the
+  stage entirely.
+
+Measured on an M4 with `small`: first run 13 s, every run after 0.85–1.1 s for
+8 s of audio.
+
+### Speed settings
+
+| Setting | Default | Effect |
+|---|---|---|
+| `language` | `"auto"` | Pinning it (`"es"`) skips detection **and** the double-decode retry |
+| `whisper_beam_size` | `1` | Greedy. whisper-cli's own default is beam search at 5, roughly 2x the decode time |
+| `whisper_threads` | `0` | Auto = performance cores only. Efficiency-core threads hold the whole batch back |
+| `whisper_flash_attn` | `"auto"` | Passes `-fa` when the installed whisper-cli advertises it |
+| `warm_up` | `true` | Compiles the Metal shaders at launch instead of on your first dictation |
+| `api_timeout_seconds` | `25` | How long a hung transcription provider stalls before the fallback runs |
+| `cleanup.timeout_seconds` | `12` | Same, for the cleanup stage |
+
+The thread default is the one worth knowing about: it used to be
+`activeProcessorCount - 2`, which on Apple Silicon puts threads on efficiency
+cores. whisper splits work evenly, so the batch waits on its slowest worker and
+adding those threads makes it slower, not faster.
 (~9× real-time). Nothing to fix — just don't judge it on the first try.
 
 **Local transcription is slow.** `medium` is ~3× slower than `small`. Drop down

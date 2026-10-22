@@ -146,7 +146,7 @@ final class WhisperServer {
         }
         guard let binary = t.resolvedWhisperServer(), let model = t.resolvedModel() else { return nil }
         return Target(binary: binary, model: model,
-                      port: config.whisper_server_port, threads: Transcriber.threadCount)
+                      port: config.whisper_server_port, threads: Transcriber.threadCount(config: config))
     }
 
     private func launch(_ target: Target) {
