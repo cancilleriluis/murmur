@@ -38,11 +38,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var downloadItem: NSMenuItem?
 
     private let work = DispatchQueue(label: "murmur.pipeline", qos: .userInitiated)
+    private var terminationSource: DispatchSourceSignal?
 
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+
+        // build.sh and the updater stop the running app with `pkill`, which
+        // is SIGTERM — and AppKit never calls applicationWillTerminate for
+        // that. The whisper-server child was left behind holding its model in
+        // RAM, one more copy per rebuild. Shut it down on the way out.
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler {
+            WhisperServer.shared.stop()
+            exit(0)
+        }
+        source.resume()
+        terminationSource = source
 
         buildStatusItem()
         wireHotkey()

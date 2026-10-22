@@ -233,22 +233,41 @@ final class WhisperServer {
         _ = try? WhisperServer.request(wav: url, port: port, language: "en", beamSize: 1)
     }
 
-    /// A crash leaves the previous server running with the model in RAM and
-    /// the port taken; reap it before starting a new one.
+    /// A crash or a kill leaves the previous server running with the model in
+    /// RAM; reap it before starting a new one.
+    ///
+    /// The pid file alone missed most of them: it holds one pid, any other
+    /// Murmur process (`--test-pipeline`, `--doctor`) overwrites it, and
+    /// whisper-server binds with SO_REUSEPORT, so a leftover never makes the
+    /// port look taken. Three copies of the model were found resident at
+    /// once. So also reap every whisper-server whose parent is launchd —
+    /// orphans by definition, since a live Murmur or a shell you started one
+    /// from would still be its parent.
     private func killOrphan() {
-        guard let text = try? String(contentsOf: WhisperServer.pidFile, encoding: .utf8),
-              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0
-        else { return }
-        defer { try? FileManager.default.removeItem(at: WhisperServer.pidFile) }
+        var pids: Set<pid_t> = []
+        if let text = try? String(contentsOf: WhisperServer.pidFile, encoding: .utf8),
+           let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+            pids.insert(pid)
+        }
+        try? FileManager.default.removeItem(at: WhisperServer.pidFile)
 
-        // PIDs get reused — only kill it if it is still a whisper-server.
-        var name = [CChar](repeating: 0, count: 64)
-        guard proc_name(pid, &name, UInt32(name.count)) > 0,
-              String(cString: name).hasPrefix("whisper-server") else { return }
-        kill(pid, SIGTERM)
-        Log.write("stopped orphaned whisper-server (pid \(pid))")
-        for _ in 0..<20 where kill(pid, 0) == 0 {
-            Thread.sleep(forTimeInterval: 0.1)
+        var buffer = [pid_t](repeating: 0, count: 4096)
+        let bytes = proc_listpids(UInt32(PROC_PPID_ONLY), 1, &buffer,
+                                  Int32(buffer.count * MemoryLayout<pid_t>.size))
+        if bytes > 0 {
+            pids.formUnion(buffer.prefix(Int(bytes) / MemoryLayout<pid_t>.size).filter { $0 > 0 })
+        }
+
+        for pid in pids {
+            // PIDs get reused — only kill it if it is still a whisper-server.
+            var name = [CChar](repeating: 0, count: 64)
+            guard proc_name(pid, &name, UInt32(name.count)) > 0,
+                  String(cString: name).hasPrefix("whisper-server") else { continue }
+            kill(pid, SIGTERM)
+            Log.write("stopped orphaned whisper-server (pid \(pid))")
+            for _ in 0..<20 where kill(pid, 0) == 0 {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
         }
     }
 }

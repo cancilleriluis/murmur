@@ -273,6 +273,10 @@ struct Transcriber {
     @discardableResult
     func warmUp(force: Bool = false) -> Double? {
         guard force || config.warm_up, localIsAvailable() else { return nil }
+        // whisper-server warms itself once its model is loaded. Racing it
+        // here usually lost — the server wasn't ready yet, so this launched
+        // whisper-cli and loaded a second copy of the model just to warm up.
+        if !force, config.whisper_server, resolvedWhisperServer() != nil { return nil }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("murmur-warmup-\(UUID().uuidString).wav")
         // Half a second of silence. whisper pads every clip to its 30 s window
