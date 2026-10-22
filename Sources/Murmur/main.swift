@@ -77,7 +77,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // queue, rather than on the user's first dictation. Same queue on
         // purpose: it guarantees this never runs alongside a real take.
         let cfg = store.config
-        work.async { Transcriber(config: cfg).warmUp() }
+        work.async {
+            Transcriber(config: cfg).warmUp()
+            Cleanup(config: cfg).warmUp()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -290,7 +293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 let style = config.style(forApp: job.app)
                 Log.write("style \(style) for \(job.app ?? "unknown app")")
-                output = cleanup.polish(raw, style: style)
+                output = cleanup.polish(raw, style: style, language: lang)
                 History.add(text: output, language: lang,
                             duration: take.duration, config: config.history)
             }
@@ -1097,7 +1100,7 @@ if CommandLine.arguments.contains("--test-pipeline") {
         }
 
         let mid = Date()
-        let polished = c.polish(raw)
+        let polished = c.polish(raw, language: t.result.language)
         let tClean = Date().timeIntervalSince(mid)
         print("CLEANED  (\(String(format: "%.2f", tClean))s): \(polished)")
         WhisperServer.shared.stop()

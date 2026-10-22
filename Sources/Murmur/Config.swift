@@ -312,6 +312,10 @@ struct Config: Codable {
     - A blank line.
     - Numbered points written as `1)`, `2)`, `3)` — a digit, a closing \
       parenthesis, then a space. Never `1.`, never `#`, never `**`.
+    - Each point is the speaker's own full sentences, cleaned but complete — \
+      subject, verb and every detail kept. Never compress a point into a note \
+      or a heading ("Want to know transfer time" is wrong; "I want to know how \
+      long the transfer takes" is right).
     - If a point breaks into sub-items, put them under it as `- ` bullets, \
       indented by three spaces.
     - One blank line between points. Nothing else: no closing summary, no \

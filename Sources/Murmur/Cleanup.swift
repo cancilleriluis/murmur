@@ -77,9 +77,30 @@ struct Cleanup {
     /// True when some provider can be called (a key is set, or it's local).
     var isAvailable: Bool { resolveProvider() != nil }
 
+    /// Loads a local cleanup model into memory at launch, so the first
+    /// dictation doesn't pay for reading gigabytes off disk. Hosted providers
+    /// have nothing to warm. Same queue as the pipeline, so it never runs
+    /// alongside a real take.
+    func warmUp() {
+        guard config.cleanup.enabled, resolveProvider() == .local else { return }
+        let model = config.cleanup.model.isEmpty ? Provider.local.defaultModel : config.cleanup.model
+        let started = Date()
+        do {
+            _ = try call(provider: .local, key: Env.get(Provider.local.keyName), model: model,
+                         base: config.cleanup.base_url, system: "Reply with OK.", user: "OK",
+                         timeout: 120, capped: false)
+            Log.write(String(format: "warm-up: cleanup model %@ ready in %.2fs",
+                             model, Date().timeIntervalSince(started)))
+        } catch {
+            Log.write("warm-up: cleanup model \(model) failed: \(error.localizedDescription)")
+        }
+    }
+
     /// Returns cleaned text, or the input unchanged if cleanup is off or
     /// unavailable. `style` overrides `cleanup.style` (per-app formatting).
-    func polish(_ transcript: String, style requested: String? = nil) -> String {
+    /// `language` is whisper's detection ("es", "en", …), passed on as a hint.
+    func polish(_ transcript: String, style requested: String? = nil,
+                language: String? = nil) -> String {
         guard config.cleanup.enabled else { return transcript }
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return transcript }
@@ -94,7 +115,7 @@ struct Cleanup {
 
         let system = (config.cleanup.prompt.isEmpty
             ? Config.cleanupPrompt(style: style)
-            : config.cleanup.prompt) + vocabularyNote
+            : config.cleanup.prompt) + vocabularyNote + languageNote(language)
         // Guard against a model that ignored instructions and answered the
         // text instead of cleaning it: a wild length change means bail out.
         // Structuring legitimately adds a title, numbers and newlines, so
@@ -116,6 +137,22 @@ struct Cleanup {
     func transform(_ text: String, instruction: String) -> String? {
         let user = "INSTRUCTION:\n\(instruction)\n\nTEXT:\n\(text)"
         return complete(system: Config.commandPrompt + vocabularyNote, user: user) { $0 }
+    }
+
+    /// Names the language whisper heard. The base prompt says "reply in the
+    /// transcript's language", but a small local model has to work that out
+    /// itself and gets it wrong: qwen2.5:7b turned every English dictation
+    /// into Spanish, swayed by the Spanish examples in the prompt. Stating it
+    /// outright fixes that. Mixed speech is the risk — so other-language
+    /// words are explicitly left alone rather than translated to match.
+    private func languageNote(_ code: String?) -> String {
+        guard let code = code?.lowercased(), !code.isEmpty, code != "auto" else { return "" }
+        let names = ["es": "Spanish", "en": "English", "it": "Italian", "pt": "Portuguese",
+                     "fr": "French", "de": "German", "ca": "Catalan", "gl": "Galician"]
+        let name = names[code] ?? code
+        return "\n\nLANGUAGE: speech recognition detected \(name). The output MUST be in \(name), "
+            + "the same language as the transcript. Leave any words or sentences spoken in "
+            + "another language exactly as they are — never translate them."
     }
 
     private var vocabularyNote: String {
@@ -221,11 +258,12 @@ struct Cleanup {
 
     private func call(provider: Provider, key: String?, model: String,
                       base: String, system: String, user: String,
-                      timeout: TimeInterval) throws -> String {
+                      timeout: TimeInterval, capped: Bool = true) throws -> String {
         var req = URLRequest(url: provider.endpoint(base: base))
         req.httpMethod = "POST"
-        // The per-attempt budget, capped by the user's configured ceiling.
-        req.timeoutInterval = min(timeout, max(3, config.cleanup.timeout_seconds))
+        // The per-attempt budget, capped by the user's configured ceiling —
+        // except for the warm-up, where nobody is waiting on the load.
+        req.timeoutInterval = capped ? min(timeout, max(3, config.cleanup.timeout_seconds)) : timeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let payload: [String: Any]
@@ -241,7 +279,7 @@ struct Cleanup {
             ]
         } else {
             if let key = key { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-            payload = [
+            var body: [String: Any] = [
                 "model": model,
                 "temperature": 0,
                 "stream": false,
@@ -250,6 +288,12 @@ struct Cleanup {
                     ["role": "user", "content": user],
                 ],
             ]
+            // Ollama unloads a model after 5 idle minutes, and reloading it
+            // costs more than the 12 s cleanup budget — so the first dictation
+            // after a coffee break came back uncleaned. Keep it resident for an
+            // hour instead. Other OpenAI-compatible servers ignore the field.
+            if provider == .local { body["keep_alive"] = "60m" }
+            payload = body
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 

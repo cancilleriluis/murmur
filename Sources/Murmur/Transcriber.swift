@@ -623,8 +623,11 @@ struct Transcriber {
         for p in patterns {
             s = s.replacingOccurrences(of: p, with: "", options: .regularExpression)
         }
-        s = s.replacingOccurrences(of: #"[ \t]+"#, with: " ", options: .regularExpression)
-        s = s.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+        // whisper-cli's .txt puts each ~3 s segment on its own line, which
+        // breaks sentences mid-phrase. The breaks mean nothing — speech has no
+        // line breaks — and handed to the cleanup model they read as structure
+        // the speaker never gave, so join everything into one run of text.
+        s = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
