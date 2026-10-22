@@ -321,10 +321,13 @@ struct Config: Codable {
     static let cleanupStyleAuto = """
 
     FORMATTING: if the speaker is clearly enumerating several distinct points, \
-    ideas, or steps — including when they say "point one", "punto dos", "first", \
-    "primero", "and another thing" — organize the result. If instead it is a \
-    single continuous thought, a message, or a short remark, leave it as plain \
-    prose with NO title and NO list. Judge by the content: only structure what \
+    ideas, steps, questions, or requests — including when they say "point one", \
+    "punto dos", "first", "primero", "and another thing", "also I want" — \
+    organize the result. If instead it is a single continuous thought, a \
+    message, or a short remark, leave it as plain prose with NO title and NO \
+    list. Prose longer than three or four sentences is NOT one block: break it \
+    into short paragraphs, separated by a blank line, wherever the topic \
+    shifts. Judge by the content: only structure what \
     is genuinely structured, and never invent points that were not spoken. \
     Spoken enumerators ("punto uno", "point two") are the cue to structure — \
     drop the enumerator itself and let the number carry it.
@@ -510,6 +513,46 @@ enum Env {
     private static var dotenv: [String: String] = loadDotenv()
 
     static func reload() { dotenv = loadDotenv() }
+
+    /// Sets keys in ~/.config/murmur/.env — nil removes one — and reloads.
+    ///
+    /// Every other line is kept as it was, comments and keys this app doesn't
+    /// know included, because this file is the user's and may hold more than
+    /// Murmur's keys. The file stays owner-only (0600): it is the one place
+    /// secrets live, which is why keys never go into config.json.
+    static func write(_ updates: [String: String?]) throws {
+        var text = (try? String(contentsOf: Paths.envFile, encoding: .utf8)) ?? ""
+        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        var lines = text.components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+
+        var written: Set<String> = []
+        lines = lines.compactMap { line in
+            var body = line.trimmingCharacters(in: .whitespaces)
+            if body.hasPrefix("export ") {
+                body = String(body.dropFirst("export ".count)).trimmingCharacters(in: .whitespaces)
+            }
+            guard !body.hasPrefix("#"), let eq = body.firstIndex(of: "=") else { return line }
+            let name = body[..<eq].trimmingCharacters(in: .whitespaces)
+            guard let update = updates[name] else { return line }
+            // A key listed twice: the first line takes the value, the rest go,
+            // so an old duplicate can't shadow what was just saved.
+            guard written.insert(name).inserted, let value = update else { return nil }
+            return "\(name)=\(sanitize(value))"
+        }
+        for (name, value) in updates.sorted(by: { $0.key < $1.key })
+            where !written.contains(name) {
+            if let value = value { lines.append("\(name)=\(sanitize(value))") }
+        }
+
+        try (lines.joined(separator: "\n") + "\n")
+            .write(to: Paths.envFile, atomically: true, encoding: .utf8)
+        // An atomic write replaces the file, and the new one gets default
+        // permissions; put owner-only back.
+        try FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                              ofItemAtPath: Paths.envFile.path)
+        reload()
+    }
 
     /// Characters that end up inside a pasted key and make an otherwise valid
     /// key 401. A wrapped line in TextEdit, a non-breaking space copied out of
